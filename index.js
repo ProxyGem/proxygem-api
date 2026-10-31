@@ -116,6 +116,26 @@ function publicUser(user) {
   };
 }
 
+let premiumQueue = Promise.resolve();
+
+function runPremiumExclusive(task) {
+  const result = premiumQueue.then(task, task);
+  premiumQueue = result.catch(() => {});
+  return result;
+}
+
+function durationDays(duration) {
+  const durations = {
+    '7_days': 7,
+    '1_month': 30,
+    '3_months': 90,
+    '6_months': 180,
+    'forever': 3650
+  };
+
+  return durations[duration] || 30;
+}
+
 // ==========================================
 // DATABASE INITIALIZATION
 // ==========================================
@@ -130,12 +150,19 @@ async function initializeDatabase() {
     )
   `);
 
-  await dbRun(`
-    CREATE TABLE IF NOT EXISTS key_status (
-      key_id TEXT PRIMARY KEY,
-      gived INTEGER DEFAULT 0
-    )
-  `);
+await dbRun(`
+  CREATE TABLE IF NOT EXISTS key_status (
+    key_id TEXT PRIMARY KEY,
+    gived INTEGER DEFAULT 0,
+    used INTEGER DEFAULT 0
+  )
+`);
+
+const keyStatusColumns = await dbAll('PRAGMA table_info(key_status)');
+
+if (!keyStatusColumns.some(c => c.name === 'used')) {
+  await dbRun('ALTER TABLE key_status ADD COLUMN used INTEGER DEFAULT 0');
+}
 
   await dbRun(`
     CREATE TABLE IF NOT EXISTS users (
@@ -252,6 +279,43 @@ async function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS idx_activations_device
     ON activations(device_id)
   `);
+}
+
+// Восстанавливаем выданные и использованные ключи после перезапуска.
+const savedKeyStatuses = await dbAll(
+  'SELECT key_id, gived, used FROM key_status'
+);
+
+for (const row of savedKeyStatuses) {
+  const id = String(row.key_id).toUpperCase();
+
+  if (secretKeys[id]) {
+    secretKeys[id].gived = Boolean(row.gived);
+    secretKeys[id].used = Boolean(row.used);
+  }
+}
+
+// Дополнительно проверяем реальные активации из SQLite.
+for (const [id, config] of Object.entries(secretKeys)) {
+  const result = await dbGet(
+    'SELECT COUNT(*) AS count FROM activations WHERE key_id = ?',
+    [id]
+  );
+
+  const max = Math.max(1, Number(config.max_activations) || 1);
+
+  if ((result?.count || 0) >= max) {
+    config.used = true;
+
+    await dbRun(
+      `INSERT INTO key_status (key_id, gived, used)
+       VALUES (?, 1, 1)
+       ON CONFLICT(key_id) DO UPDATE SET
+         gived = 1,
+         used = 1`,
+      [id]
+    );
+  }
 }
 
 // ==========================================
@@ -657,141 +721,191 @@ app.post('/api/get-key', async (req, res) => {
 // ACTIVATE PREMIUM
 // ==========================================
 
-app.post('/api/activate', (req, res) => {
-  const key = String(req.body?.key || '').trim().toUpperCase();
-  const deviceId = String(req.body?.deviceId || '').trim();
+app.post('/api/activate', async (req, res) => {
+  try {
+    const key = String(req.body?.key || '').trim().toUpperCase();
+    const deviceId = String(req.body?.deviceId || '').trim();
 
-  if (!key || !deviceId) {
-    return res.status(400).json({
-      success: false,
-      message: 'Не переданы данные'
-    });
-  }
-
-  const config = secretKeys[key];
-
-  if (!config) {
-    return res.status(404).json({
-      success: false,
-      message: 'invalid_key'
-    });
-  }
-
-  db.get(
-    'SELECT * FROM activations WHERE key_id = ? AND device_id = ?',
-    [key, deviceId],
-    (err, row) => {
-      if (err) {
-        return res.status(500).json({
-          success: false,
-          message: 'db_error'
-        });
-      }
-
-      if (row) {
-        return res.status(400).json({
-          success: false,
-          message: 'already_activated_here'
-        });
-      }
-
-      db.get(
-        'SELECT COUNT(*) AS count FROM activations WHERE key_id = ?',
-        [key],
-        (err2, result) => {
-          if (err2) {
-            return res.status(500).json({
-              success: false,
-              message: 'db_error'
-            });
-          }
-
-          if (result.count >= Number(config.max_activations || 1)) {
-            return res.status(400).json({
-              success: false,
-              message: 'exhausted'
-            });
-          }
-
-          const durations = {
-            '7_days': 7,
-            '1_month': 30,
-            '3_months': 90,
-            '6_months': 180,
-            'forever': 3650
-          };
-
-          const expires = Date.now() +
-            (durations[config.duration] || 30) * 86400000;
-
-          db.run(
-            `INSERT INTO activations
-             (key_id, device_id, expires)
-             VALUES (?, ?, ?)`,
-            [key, deviceId, expires],
-            err3 => {
-              if (err3) {
-                return res.status(500).json({
-                  success: false,
-                  message: 'db_error'
-                });
-              }
-
-              if (
-                result.count + 1 >=
-                Number(config.max_activations || 1)
-              ) {
-                config.used = true;
-              }
-
-              res.json({
-                success: true,
-                message: 'premium_activated',
-                duration: config.duration,
-                expires
-              });
-            }
-          );
-        }
-      );
+    if (!key || !deviceId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Не передан ключ или ID устройства'
+      });
     }
-  );
-});
 
+    if (key.length > 200 || deviceId.length > 200) {
+      return res.status(400).json({
+        success: false,
+        message: 'Некорректные данные'
+      });
+    }
+
+    const config = secretKeys[key];
+
+    if (!config) {
+      return res.status(404).json({
+        success: false,
+        message: 'invalid_key'
+      });
+    }
+
+    const activation = await runPremiumExclusive(async () => {
+      // Проверяем сохранённый статус ключа.
+      const saved = await dbGet(
+        'SELECT gived, used FROM key_status WHERE key_id = ?',
+        [key]
+      );
+
+      if (saved?.used) {
+        config.used = true;
+      }
+
+      const existing = await dbGet(
+        `SELECT * FROM activations
+         WHERE key_id = ? AND device_id = ?
+         ORDER BY expires DESC LIMIT 1`,
+        [key, deviceId]
+      );
+
+      if (existing && existing.expires > Date.now()) {
+        return {
+          error: 'already_activated_here'
+        };
+      }
+
+      const count = await dbGet(
+        'SELECT COUNT(*) AS count FROM activations WHERE key_id = ?',
+        [key]
+      );
+
+      const max = Math.max(
+        1,
+        Number(config.max_activations) || 1
+      );
+
+      // Не разрешаем повторно использовать исчерпанный ключ.
+      if ((count?.count || 0) >= max) {
+        config.used = true;
+
+        await dbRun(
+          `INSERT INTO key_status (key_id, gived, used)
+           VALUES (?, 1, 1)
+           ON CONFLICT(key_id) DO UPDATE SET
+             gived = 1,
+             used = 1`,
+          [key]
+        );
+
+        return { error: 'exhausted' };
+      }
+
+      const expires =
+        Date.now() + durationDays(config.duration) * 86400000;
+
+      await dbRun(
+        `INSERT INTO activations (key_id, device_id, expires)
+         VALUES (?, ?, ?)`,
+        [key, deviceId, expires]
+      );
+
+      const newCount = (count?.count || 0) + 1;
+      const used = newCount >= max;
+
+      await dbRun(
+        `INSERT INTO key_status (key_id, gived, used)
+         VALUES (?, 1, ?)
+         ON CONFLICT(key_id) DO UPDATE SET
+           gived = 1,
+           used = MAX(key_status.used, excluded.used)`,
+        [key, used ? 1 : 0]
+      );
+
+      config.gived = true;
+      config.used = used;
+
+      return {
+        expires,
+        duration: config.duration
+      };
+    });
+
+    if (activation.error) {
+      const messages = {
+        already_activated_here: 'Этот ключ уже активирован на данном устройстве',
+        exhausted: 'Лимит активаций этого ключа исчерпан'
+      };
+
+      return res.status(400).json({
+        success: false,
+        message: activation.error,
+        error: messages[activation.error]
+      });
+    }
+
+    console.log(`Ключ ${key} активирован на устройстве ${deviceId}`);
+
+    return res.json({
+      success: true,
+      message: 'premium_activated',
+      duration: activation.duration,
+      expires: activation.expires
+    });
+
+  } catch (e) {
+    console.error('ACTIVATE ERROR:', e);
+
+    return res.status(500).json({
+      success: false,
+      message: 'Ошибка активации ключа',
+      error: process.env.NODE_ENV === 'development'
+        ? e.message
+        : undefined
+    });
+  }
+});
 // ==========================================
 // PREMIUM STATUS
 // ==========================================
 
-app.get('/api/status', (req, res) => {
-  const deviceId = String(req.query.deviceId || '').trim();
+app.get('/api/status', async (req, res) => {
+  try {
+    const deviceId = String(req.query.deviceId || '').trim();
 
-  if (!deviceId) {
-    return res.status(400).json({ active: false });
-  }
-
-  db.get(
-    `SELECT * FROM activations
-     WHERE device_id = ?
-     ORDER BY expires DESC LIMIT 1`,
-    [deviceId],
-    (err, row) => {
-      if (err) {
-        return res.status(500).json({ active: false });
-      }
-
-      if (row && Date.now() < row.expires) {
-        const config = secretKeys[row.key_id] || {};
-
-        return res.json({
-          active: true,
-          expires: row.expires,
-          duration: config.duration || '1_month'
-        });
-      }
-
-      res.json({ active: false });
+    if (!deviceId) {
+      return res.status(400).json({
+        active: false,
+        message: 'Не передан ID устройства'
+      });
     }
-  );
+
+    const row = await dbGet(
+      `SELECT * FROM activations
+       WHERE device_id = ?
+       ORDER BY expires DESC
+       LIMIT 1`,
+      [deviceId]
+    );
+
+    if (!row || Date.now() >= row.expires) {
+      return res.json({ active: false });
+    }
+
+    const config = secretKeys[row.key_id] || {};
+
+    return res.json({
+      active: true,
+      expires: row.expires,
+      duration: config.duration || '1_month'
+    });
+
+  } catch (e) {
+    console.error('STATUS ERROR:', e);
+
+    return res.status(500).json({
+      active: false,
+      message: 'Ошибка проверки Premium'
+    });
+  }
 });
 
 // ==========================================
