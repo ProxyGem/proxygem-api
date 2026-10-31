@@ -1,4 +1,3 @@
-
 const express = require('express');
 const cors = require('cors');
 const sqlite3 = require('sqlite3').verbose();
@@ -150,19 +149,19 @@ async function initializeDatabase() {
     )
   `);
 
-await dbRun(`
-  CREATE TABLE IF NOT EXISTS key_status (
-    key_id TEXT PRIMARY KEY,
-    gived INTEGER DEFAULT 0,
-    used INTEGER DEFAULT 0
-  )
-`);
+  await dbRun(`
+    CREATE TABLE IF NOT EXISTS key_status (
+      key_id TEXT PRIMARY KEY,
+      gived INTEGER DEFAULT 0,
+      used INTEGER DEFAULT 0
+    )
+  `);
 
-const keyStatusColumns = await dbAll('PRAGMA table_info(key_status)');
+  const keyStatusColumns = await dbAll('PRAGMA table_info(key_status)');
 
-if (!keyStatusColumns.some(c => c.name === 'used')) {
-  await dbRun('ALTER TABLE key_status ADD COLUMN used INTEGER DEFAULT 0');
-}
+  if (!keyStatusColumns.some(c => c.name === 'used')) {
+    await dbRun('ALTER TABLE key_status ADD COLUMN used INTEGER DEFAULT 0');
+  }
 
   await dbRun(`
     CREATE TABLE IF NOT EXISTS users (
@@ -281,40 +280,46 @@ if (!keyStatusColumns.some(c => c.name === 'used')) {
   `);
 }
 
-// Восстанавливаем выданные и использованные ключи после перезапуска.
-const savedKeyStatuses = await dbAll(
-  'SELECT key_id, gived, used FROM key_status'
-);
+// ==========================================
+// RESTORE KEY STATUSES
+// ==========================================
 
-for (const row of savedKeyStatuses) {
-  const id = String(row.key_id).toUpperCase();
-
-  if (secretKeys[id]) {
-    secretKeys[id].gived = Boolean(row.gived);
-    secretKeys[id].used = Boolean(row.used);
-  }
-}
-
-// Дополнительно проверяем реальные активации из SQLite.
-for (const [id, config] of Object.entries(secretKeys)) {
-  const result = await dbGet(
-    'SELECT COUNT(*) AS count FROM activations WHERE key_id = ?',
-    [id]
+async function restoreKeyStatuses() {
+  // Восстанавливаем выданные и использованные ключи после перезапуска.
+  const savedKeyStatuses = await dbAll(
+    'SELECT key_id, gived, used FROM key_status'
   );
 
-  const max = Math.max(1, Number(config.max_activations) || 1);
+  for (const row of savedKeyStatuses) {
+    const id = String(row.key_id).toUpperCase();
 
-  if ((result?.count || 0) >= max) {
-    config.used = true;
+    if (secretKeys[id]) {
+      secretKeys[id].gived = Boolean(row.gived);
+      secretKeys[id].used = Boolean(row.used);
+    }
+  }
 
-    await dbRun(
-      `INSERT INTO key_status (key_id, gived, used)
-       VALUES (?, 1, 1)
-       ON CONFLICT(key_id) DO UPDATE SET
-         gived = 1,
-         used = 1`,
+  // Дополнительно проверяем реальные активации из SQLite.
+  for (const [id, config] of Object.entries(secretKeys)) {
+    const result = await dbGet(
+      'SELECT COUNT(*) AS count FROM activations WHERE key_id = ?',
       [id]
     );
+
+    const max = Math.max(1, Number(config.max_activations) || 1);
+
+    if ((result?.count || 0) >= max) {
+      config.used = true;
+
+      await dbRun(
+        `INSERT INTO key_status (key_id, gived, used)
+         VALUES (?, 1, 1)
+         ON CONFLICT(key_id) DO UPDATE SET
+           gived = 1,
+           used = 1`,
+        [id]
+      );
+    }
   }
 }
 
@@ -863,6 +868,7 @@ app.post('/api/activate', async (req, res) => {
     });
   }
 });
+
 // ==========================================
 // PREMIUM STATUS
 // ==========================================
@@ -959,6 +965,7 @@ app.use((err, req, res, next) => {
 // ==========================================
 
 initializeDatabase()
+  .then(restoreKeyStatuses)
   .then(() => {
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`ProxyGem API запущен на порту ${PORT}`);
