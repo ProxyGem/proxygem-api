@@ -9,32 +9,55 @@ const fs = require('fs');
 const path = require('path');
 
 const app = express();
+const PORT = process.env.PORT || 3000;
 
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: Number(process.env.SMTP_PORT || 2525),
-  secure: false,
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS
-  },
-  connectionTimeout: 20000,
-  greetingTimeout: 20000,
-  socketTimeout: 30000
-});
+// ==========================================
+// 1. CORS И JSON
+// ==========================================
 
 const allowedOrigins = process.env.CORS_ORIGIN
     ? process.env.CORS_ORIGIN.split(',').map(x => x.trim())
-    : null;
+    : true;
 
 app.use(cors({
-    origin: allowedOrigins || true,
+    origin: allowedOrigins,
+    credentials: false,
+    methods: ['GET', 'POST', 'PATCH', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+app.options('*', cors({
+    origin: allowedOrigins,
     credentials: false
 }));
+
 app.use(express.json({ limit: '12mb' }));
 
 // ==========================================
-// 1. КЛЮЧИ PREMIUM
+// 2. SMTP
+// ==========================================
+
+const SMTP_PORT = Number(process.env.SMTP_PORT || 2525);
+
+const mailer = (
+    process.env.SMTP_HOST &&
+    process.env.SMTP_USER &&
+    process.env.SMTP_PASS
+) ? nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: SMTP_PORT,
+    secure: SMTP_PORT === 465,
+    auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS.replace(/\s/g, '')
+    },
+    connectionTimeout: 20000,
+    greetingTimeout: 20000,
+    socketTimeout: 30000
+}) : null;
+
+// ==========================================
+// 3. PREMIUM KEYS
 // ==========================================
 
 let secretKeys = {};
@@ -54,12 +77,15 @@ try {
                 };
             });
         } else {
-            secretKeys = rawData;
+            secretKeys = keysArray;
         }
 
-        console.log(`Загружено ключей: ${Object.keys(secretKeys).length}`);
+        console.log(
+            `Загружено ключей: ${Object.keys(secretKeys).length}`
+        );
     } else {
         console.log('ВНИМАНИЕ: premium_keys не найдена');
+
         secretKeys = {
             'TEST-KEY-123': {
                 duration: '1_month',
@@ -69,27 +95,35 @@ try {
             }
         };
     }
-} catch (e) {
-    console.error('Ошибка premium_keys:', e.message);
+} catch (err) {
+    console.error('Ошибка premium_keys:', err.message);
 }
 
 // ==========================================
-// 2. SQLITE
+// 4. SQLITE
 // ==========================================
 
 const dbPath = process.env.DB_PATH || './database.sqlite';
-fs.mkdirSync(path.dirname(path.resolve(dbPath)), { recursive: true });
+
+fs.mkdirSync(
+    path.dirname(path.resolve(dbPath)),
+    { recursive: true }
+);
 
 const db = new sqlite3.Database(dbPath, err => {
-    if (err) console.error('Ошибка SQLite:', err.message);
-    else console.log('SQLite подключена:', dbPath);
+    if (err) {
+        console.error('Ошибка SQLite:', err.message);
+    } else {
+        console.log('SQLite подключена:', dbPath);
+    }
 });
 
 const dbGet = (sql, params = []) =>
     new Promise((resolve, reject) => {
-        db.get(sql, params, (err, row) =>
-            err ? reject(err) : resolve(row)
-        );
+        db.get(sql, params, (err, row) => {
+            if (err) reject(err);
+            else resolve(row);
+        });
     });
 
 const dbRun = (sql, params = []) =>
@@ -100,73 +134,66 @@ const dbRun = (sql, params = []) =>
         });
     });
 
-db.serialize(() => {
-    db.run(`CREATE TABLE IF NOT EXISTS activations (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        key_id TEXT,
-        device_id TEXT,
-        expires INTEGER
-    )`);
+function initializeDatabase() {
+    return new Promise((resolve, reject) => {
+        db.serialize(() => {
+            db.run(`CREATE TABLE IF NOT EXISTS activations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key_id TEXT,
+                device_id TEXT,
+                expires INTEGER
+            )`);
 
-    db.run(`CREATE TABLE IF NOT EXISTS key_status (
-        key_id TEXT PRIMARY KEY,
-        gived INTEGER DEFAULT 0
-    )`);
+            db.run(`CREATE TABLE IF NOT EXISTS key_status (
+                key_id TEXT PRIMARY KEY,
+                gived INTEGER DEFAULT 0
+            )`);
 
-    db.run(`CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT NOT NULL,
-        username_norm TEXT NOT NULL UNIQUE,
-        email TEXT NOT NULL,
-        email_norm TEXT NOT NULL UNIQUE,
-        password_hash TEXT NOT NULL,
-        avatar TEXT DEFAULT '',
-        cover TEXT DEFAULT '',
-        created_at INTEGER NOT NULL
-    )`);
+            db.run(`CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                username_norm TEXT NOT NULL UNIQUE,
+                email TEXT NOT NULL,
+                email_norm TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                avatar TEXT DEFAULT '',
+                cover TEXT DEFAULT '',
+                created_at INTEGER NOT NULL
+            )`);
 
-    db.run(`CREATE TABLE IF NOT EXISTS auth_codes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        purpose TEXT NOT NULL,
-        email_norm TEXT NOT NULL,
-        username TEXT,
-        password_hash TEXT,
-        code_hash TEXT NOT NULL,
-        expires_at INTEGER NOT NULL,
-        attempts INTEGER DEFAULT 0,
-        created_at INTEGER NOT NULL
-    )`);
+            db.run(`CREATE TABLE IF NOT EXISTS auth_codes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                purpose TEXT NOT NULL,
+                email_norm TEXT NOT NULL,
+                username TEXT,
+                password_hash TEXT,
+                code_hash TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                attempts INTEGER DEFAULT 0,
+                created_at INTEGER NOT NULL
+            )`);
 
-    db.run(`CREATE TABLE IF NOT EXISTS sessions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        token_hash TEXT NOT NULL UNIQUE,
-        expires_at INTEGER NOT NULL,
-        created_at INTEGER NOT NULL
-    )`);
-});
+            db.run(`CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            )`);
+
+            db.get('SELECT 1', [], err => {
+                if (err) reject(err);
+                else resolve();
+            });
+        });
+    });
+}
 
 // ==========================================
-// 3. ПОЧТА И ЗАЩИТА
+// 5. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 // ==========================================
 
 const CODE_PEPPER = process.env.CODE_PEPPER;
-
-const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
-
-const mailer = process.env.SMTP_USER &&
-               process.env.SMTP_PASS &&
-               process.env.SMTP_HOST
-    ? nodemailer.createTransport({
-        host: process.env.SMTP_HOST,
-        port: SMTP_PORT,
-        secure: SMTP_PORT === 465,
-        auth: {
-            user: process.env.SMTP_USER,
-            pass: process.env.SMTP_PASS.replace(/\s/g, '')
-        }
-    })
-    : null;
 
 const normalizeEmail = email =>
     String(email || '').trim().toLowerCase();
@@ -184,7 +211,9 @@ const hashSecret = value =>
     crypto.createHash('sha256').update(value).digest('hex');
 
 const hashCode = (email, purpose, code) => {
-    if (!CODE_PEPPER) throw new Error('CODE_PEPPER не настроен');
+    if (!CODE_PEPPER) {
+        throw new Error('CODE_PEPPER не настроен');
+    }
 
     return crypto.createHmac('sha256', CODE_PEPPER)
         .update(`${purpose}:${email}:${code}`)
@@ -208,6 +237,10 @@ const publicUser = user => ({
     createdAt: user.created_at
 });
 
+// ==========================================
+// 6. ОТПРАВКА EMAIL
+// ==========================================
+
 async function sendVerificationCode(email, code, purpose) {
     if (!mailer) {
         throw new Error('SMTP не настроен');
@@ -225,7 +258,7 @@ async function sendVerificationCode(email, code, purpose) {
         from: process.env.SMTP_FROM || process.env.SMTP_USER,
         to: email,
         subject,
-        text: `${description}\n\n${code}\n\nКод действителен 10 минут. Если ты не запрашивал его, просто проигнорируй письмо.`,
+        text: `${description}\n\n${code}\n\nКод действителен 10 минут.`,
         html: `
             <div style="font-family:Arial,sans-serif;max-width:500px;margin:auto">
                 <h2>ProxyGem</h2>
@@ -234,11 +267,14 @@ async function sendVerificationCode(email, code, purpose) {
                     ${code}
                 </div>
                 <p>Код действителен 10 минут.</p>
-                <p>Если ты не запрашивал код, проигнорируй письмо.</p>
             </div>
         `
     });
 }
+
+// ==========================================
+// 7. СЕССИИ И АВТОРИЗАЦИЯ
+// ==========================================
 
 async function createSession(userId) {
     const token = crypto.randomBytes(32).toString('base64url');
@@ -259,12 +295,15 @@ async function createSession(userId) {
 async function authMiddleware(req, res, next) {
     try {
         const header = req.headers.authorization || '';
+
         const token = header.startsWith('Bearer ')
             ? header.slice(7)
             : '';
 
         if (!token) {
-            return res.status(401).json({ message: 'Необходим вход' });
+            return res.status(401).json({
+                message: 'Необходим вход'
+            });
         }
 
         const session = await dbGet(
@@ -277,20 +316,26 @@ async function authMiddleware(req, res, next) {
         );
 
         if (!session || session.expires_at < Date.now()) {
-            return res.status(401).json({ message: 'Сессия истекла' });
+            return res.status(401).json({
+                message: 'Сессия истекла'
+            });
         }
 
         req.user = session;
         req.sessionId = session.session_id;
+
         next();
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ message: 'Ошибка авторизации' });
+        console.error('AUTH MIDDLEWARE:', err);
+
+        res.status(500).json({
+            message: 'Ошибка авторизации'
+        });
     }
 }
 
 // ==========================================
-// 4. ПРОВЕРКА ИМЕНИ ПОЛЬЗОВАТЕЛЯ
+// 8. ПРОВЕРКА USERNAME
 // ==========================================
 
 app.get('/api/auth/check-username', async (req, res) => {
@@ -300,7 +345,7 @@ app.get('/api/auth/check-username', async (req, res) => {
         if (!validUsername(username)) {
             return res.json({
                 available: false,
-                message: 'Имя: 3–24 символа, только латинские буквы, цифры и _'
+                message: 'Имя: 3–24 символа, латинские буквы, цифры и _'
             });
         }
 
@@ -314,20 +359,25 @@ app.get('/api/auth/check-username', async (req, res) => {
             message: existing ? 'Имя уже занято' : 'Имя свободно'
         });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ message: 'Ошибка базы данных' });
+        console.error('CHECK USERNAME:', err);
+
+        res.status(500).json({
+            message: 'Ошибка базы данных'
+        });
     }
 });
 
 // ==========================================
-// 5. ЗАПРОС КОДА РЕГИСТРАЦИИ
+// 9. РЕГИСТРАЦИЯ: ЗАПРОС КОДА
 // ==========================================
 
 app.post('/api/auth/register/request-code', async (req, res) => {
     try {
-        const username = String(req.body.username || '').trim();
-        const email = normalizeEmail(req.body.email);
-        const password = String(req.body.password || '');
+        const body = req.body || {};
+
+        const username = String(body.username || '').trim();
+        const email = normalizeEmail(body.email);
+        const password = String(body.password || '');
 
         if (!validUsername(username)) {
             return res.status(400).json({
@@ -336,7 +386,9 @@ app.post('/api/auth/register/request-code', async (req, res) => {
         }
 
         if (!validEmail(email)) {
-            return res.status(400).json({ message: 'Некорректный email' });
+            return res.status(400).json({
+                message: 'Некорректный email'
+            });
         }
 
         if (password.length < 8 || password.length > 128) {
@@ -351,13 +403,13 @@ app.post('/api/auth/register/request-code', async (req, res) => {
             });
         }
 
-        const existingUser = await dbGet(
+        const existing = await dbGet(
             `SELECT id FROM users
              WHERE username_norm = ? OR email_norm = ?`,
             [normalizeUsername(username), email]
         );
 
-        if (existingUser) {
+        if (existing) {
             return res.status(409).json({
                 message: 'Имя пользователя или email уже зарегистрированы'
             });
@@ -415,6 +467,7 @@ app.post('/api/auth/register/request-code', async (req, res) => {
                  WHERE purpose = 'register' AND email_norm = ?`,
                 [email]
             );
+
             throw mailError;
         }
 
@@ -424,21 +477,28 @@ app.post('/api/auth/register/request-code', async (req, res) => {
         });
     } catch (err) {
         console.error('REGISTER REQUEST:', err);
-        res.status(500).json({ message: 'Не удалось отправить код' });
+
+        res.status(500).json({
+            message: 'Не удалось отправить код'
+        });
     }
 });
 
 // ==========================================
-// 6. ПОДТВЕРЖДЕНИЕ РЕГИСТРАЦИИ
+// 10. РЕГИСТРАЦИЯ: ПОДТВЕРЖДЕНИЕ
 // ==========================================
 
 app.post('/api/auth/register/verify', async (req, res) => {
     try {
-        const email = normalizeEmail(req.body.email);
-        const code = String(req.body.code || '').trim();
+        const body = req.body || {};
+
+        const email = normalizeEmail(body.email);
+        const code = String(body.code || '').trim();
 
         if (!validEmail(email) || !/^\d{6}$/.test(code)) {
-            return res.status(400).json({ message: 'Неверные данные' });
+            return res.status(400).json({
+                message: 'Неверные данные'
+            });
         }
 
         const pending = await dbGet(
@@ -460,18 +520,18 @@ app.post('/api/auth/register/verify', async (req, res) => {
             });
         }
 
-        const correct = safeEqual(
+        if (!safeEqual(
             pending.code_hash,
             hashCode(email, 'register', code)
-        );
-
-        if (!correct) {
+        )) {
             await dbRun(
                 'UPDATE auth_codes SET attempts = attempts + 1 WHERE id = ?',
                 [pending.id]
             );
 
-            return res.status(400).json({ message: 'Неверный код' });
+            return res.status(400).json({
+                message: 'Неверный код'
+            });
         }
 
         const collision = await dbGet(
@@ -501,7 +561,10 @@ app.post('/api/auth/register/verify', async (req, res) => {
             ]
         );
 
-        await dbRun('DELETE FROM auth_codes WHERE id = ?', [pending.id]);
+        await dbRun(
+            'DELETE FROM auth_codes WHERE id = ?',
+            [pending.id]
+        );
 
         const user = await dbGet(
             'SELECT * FROM users WHERE id = ?',
@@ -517,18 +580,23 @@ app.post('/api/auth/register/verify', async (req, res) => {
         });
     } catch (err) {
         console.error('REGISTER VERIFY:', err);
-        res.status(500).json({ message: 'Ошибка регистрации' });
+
+        res.status(500).json({
+            message: 'Ошибка регистрации'
+        });
     }
 });
 
 // ==========================================
-// 7. ВХОД
+// 11. ВХОД
 // ==========================================
 
 app.post('/api/auth/login', async (req, res) => {
     try {
-        const username = normalizeUsername(req.body.username);
-        const password = String(req.body.password || '');
+        const body = req.body || {};
+
+        const username = normalizeUsername(body.username);
+        const password = String(body.password || '');
 
         const user = await dbGet(
             'SELECT * FROM users WHERE username_norm = ?',
@@ -541,7 +609,10 @@ app.post('/api/auth/login', async (req, res) => {
             });
         }
 
-        const valid = await argon2.verify(user.password_hash, password);
+        const valid = await argon2.verify(
+            user.password_hash,
+            password
+        );
 
         if (!valid) {
             return res.status(401).json({
@@ -558,30 +629,37 @@ app.post('/api/auth/login', async (req, res) => {
         });
     } catch (err) {
         console.error('LOGIN:', err);
-        res.status(500).json({ message: 'Ошибка входа' });
+
+        res.status(500).json({
+            message: 'Ошибка входа'
+        });
     }
 });
 
 // ==========================================
-// 8. ТЕКУЩИЙ ПОЛЬЗОВАТЕЛЬ
+// 12. ТЕКУЩИЙ ПОЛЬЗОВАТЕЛЬ
 // ==========================================
 
 app.get('/api/auth/me', authMiddleware, (req, res) => {
-    res.json({ user: publicUser(req.user) });
+    res.json({
+        user: publicUser(req.user)
+    });
 });
 
 // ==========================================
-// 9. ИЗМЕНЕНИЕ ПРОФИЛЯ
+// 13. ИЗМЕНЕНИЕ ПРОФИЛЯ
 // ==========================================
 
 app.patch('/api/profile', authMiddleware, async (req, res) => {
     try {
+        const body = req.body || {};
+
         const username = String(
-            req.body.username ?? req.user.username
+            body.username ?? req.user.username
         ).trim();
 
-        const avatar = req.body.avatar ?? req.user.avatar;
-        const cover = req.body.cover ?? req.user.cover;
+        const avatar = body.avatar ?? req.user.avatar;
+        const cover = body.cover ?? req.user.cover;
 
         if (!validUsername(username)) {
             return res.status(400).json({
@@ -630,21 +708,27 @@ app.patch('/api/profile', authMiddleware, async (req, res) => {
             [req.user.id]
         );
 
-        res.json({ success: true, user: publicUser(user) });
+        res.json({
+            success: true,
+            user: publicUser(user)
+        });
     } catch (err) {
         console.error('PROFILE:', err);
-        res.status(500).json({ message: 'Не удалось сохранить профиль' });
+
+        res.status(500).json({
+            message: 'Не удалось сохранить профиль'
+        });
     }
 });
 
 // ==========================================
-// 10. ЗАПРОС КОДА ВОССТАНОВЛЕНИЯ ПАРОЛЯ
+// 14. ВОССТАНОВЛЕНИЕ ПАРОЛЯ: ЗАПРОС КОДА
 // ==========================================
 
 app.post('/api/auth/password/request-code', async (req, res) => {
-    const email = normalizeEmail(req.body.email);
+    const body = req.body || {};
+    const email = normalizeEmail(body.email);
 
-    // Одинаковый ответ независимо от существования аккаунта.
     const genericResponse = {
         success: true,
         message: 'Если аккаунт существует, код будет отправлен на почту'
@@ -666,7 +750,9 @@ app.post('/api/auth/password/request-code', async (req, res) => {
             [email]
         );
 
-        if (!user) return res.json(genericResponse);
+        if (!user) {
+            return res.json(genericResponse);
+        }
 
         const previous = await dbGet(
             `SELECT created_at FROM auth_codes
@@ -708,28 +794,36 @@ app.post('/api/auth/password/request-code', async (req, res) => {
                  WHERE purpose = 'reset' AND email_norm = ?`,
                 [email]
             );
+
             throw mailError;
         }
 
         res.json(genericResponse);
     } catch (err) {
         console.error('RESET REQUEST:', err);
-        res.status(500).json({ message: 'Ошибка отправки письма' });
+
+        res.status(500).json({
+            message: 'Ошибка отправки письма'
+        });
     }
 });
 
 // ==========================================
-// 11. СБРОС ПАРОЛЯ
+// 15. ВОССТАНОВЛЕНИЕ ПАРОЛЯ: СБРОС
 // ==========================================
 
 app.post('/api/auth/password/reset', async (req, res) => {
     try {
-        const email = normalizeEmail(req.body.email);
-        const code = String(req.body.code || '').trim();
-        const newPassword = String(req.body.newPassword || '');
+        const body = req.body || {};
+
+        const email = normalizeEmail(body.email);
+        const code = String(body.code || '').trim();
+        const newPassword = String(body.newPassword || '');
 
         if (!validEmail(email) || !/^\d{6}$/.test(code)) {
-            return res.status(400).json({ message: 'Неверные данные' });
+            return res.status(400).json({
+                message: 'Неверные данные'
+            });
         }
 
         if (newPassword.length < 8 || newPassword.length > 128) {
@@ -757,18 +851,29 @@ app.post('/api/auth/password/reset', async (req, res) => {
             });
         }
 
-        const correct = safeEqual(
+        if (!safeEqual(
             pending.code_hash,
             hashCode(email, 'reset', code)
-        );
-
-        if (!correct) {
+        )) {
             await dbRun(
                 'UPDATE auth_codes SET attempts = attempts + 1 WHERE id = ?',
                 [pending.id]
             );
 
-            return res.status(400).json({ message: 'Неверный код' });
+            return res.status(400).json({
+                message: 'Неверный код'
+            });
+        }
+
+        const user = await dbGet(
+            'SELECT id FROM users WHERE email_norm = ?',
+            [email]
+        );
+
+        if (!user) {
+            return res.status(400).json({
+                message: 'Аккаунт не найден'
+            });
         }
 
         const passwordHash = await argon2.hash(newPassword, {
@@ -778,27 +883,20 @@ app.post('/api/auth/password/reset', async (req, res) => {
             parallelism: 1
         });
 
-        const user = await dbGet(
-            'SELECT id FROM users WHERE email_norm = ?',
-            [email]
-        );
-
-        if (!user) {
-            return res.status(400).json({ message: 'Аккаунт не найден' });
-        }
-
         await dbRun(
             'UPDATE users SET password_hash = ? WHERE id = ?',
             [passwordHash, user.id]
         );
 
-        // Завершаем все старые сессии после смены пароля.
         await dbRun(
             'DELETE FROM sessions WHERE user_id = ?',
             [user.id]
         );
 
-        await dbRun('DELETE FROM auth_codes WHERE id = ?', [pending.id]);
+        await dbRun(
+            'DELETE FROM auth_codes WHERE id = ?',
+            [pending.id]
+        );
 
         res.json({
             success: true,
@@ -806,12 +904,15 @@ app.post('/api/auth/password/reset', async (req, res) => {
         });
     } catch (err) {
         console.error('PASSWORD RESET:', err);
-        res.status(500).json({ message: 'Ошибка восстановления пароля' });
+
+        res.status(500).json({
+            message: 'Ошибка восстановления пароля'
+        });
     }
 });
 
 // ==========================================
-// 12. ВЫХОД
+// 16. ВЫХОД
 // ==========================================
 
 app.post('/api/auth/logout', authMiddleware, async (req, res) => {
@@ -823,167 +924,222 @@ app.post('/api/auth/logout', authMiddleware, async (req, res) => {
 
         res.json({ success: true });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ message: 'Ошибка выхода' });
-    }
-});
+        console.error('LOGOUT:', err);
 
-// ==========================================
-// 13. ВЫДАЧА КЛЮЧА
-// ==========================================
-
-app.post('/api/get-key', (req, res) => {
-    const { duration } = req.body;
-
-    let foundKey = null;
-
-    for (const [key, data] of Object.entries(secretKeys)) {
-        if (data.duration === duration && !data.gived && !data.used) {
-            foundKey = key;
-            break;
-        }
-    }
-
-    if (!foundKey) {
-        return res.status(404).json({
-            success: false,
-            message: 'Нет свободных ключей для этого тарифа'
+        res.status(500).json({
+            message: 'Ошибка выхода'
         });
     }
-
-    db.run(
-        'INSERT OR REPLACE INTO key_status (key_id, gived) VALUES (?, 1)',
-        [foundKey],
-        err => {
-            if (err) {
-                return res.status(500).json({
-                    success: false,
-                    message: 'Ошибка базы данных'
-                });
-            }
-
-            secretKeys[foundKey].gived = true;
-            console.log(`Ключ ${foundKey} выдан`);
-
-            res.json({ success: true, key: foundKey });
-        }
-    );
 });
 
 // ==========================================
-// 14. АКТИВАЦИЯ КЛЮЧА
+// 17. ВЫДАЧА PREMIUM KEY
+// ==========================================
+
+app.post('/api/get-key', async (req, res) => {
+    try {
+        const body = req.body || {};
+        const duration = body.duration;
+
+        let foundKey = null;
+
+        for (const [key, data] of Object.entries(secretKeys)) {
+            if (
+                data.duration === duration &&
+                !data.gived &&
+                !data.used
+            ) {
+                foundKey = key;
+                break;
+            }
+        }
+
+        if (!foundKey) {
+            return res.status(404).json({
+                success: false,
+                message: 'Нет свободных ключей для этого тарифа'
+            });
+        }
+
+        await dbRun(
+            `INSERT OR REPLACE INTO key_status (key_id, gived)
+             VALUES (?, 1)`,
+            [foundKey]
+        );
+
+        secretKeys[foundKey].gived = true;
+
+        console.log(`Ключ ${foundKey} выдан`);
+
+        res.json({
+            success: true,
+            key: foundKey
+        });
+    } catch (err) {
+        console.error('GET KEY:', err);
+
+        res.status(500).json({
+            success: false,
+            message: 'Ошибка базы данных'
+        });
+    }
+});
+
+// ==========================================
+// 18. АКТИВАЦИЯ PREMIUM KEY
 // ==========================================
 
 app.post('/api/activate', (req, res) => {
-    const { key, deviceId } = req.body;
+    try {
+        const body = req.body || {};
 
-    if (!key || !deviceId) {
-        return res.status(400).json({
-            success: false,
-            message: 'Не переданы данные'
-        });
-    }
+        const { key, deviceId } = body;
 
-    const cleanKey = key.trim().toUpperCase();
-    const keyConfig = secretKeys[cleanKey];
+        if (
+            typeof key !== 'string' ||
+            typeof deviceId !== 'string' ||
+            !key.trim() ||
+            !deviceId.trim()
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: 'Не переданы данные'
+            });
+        }
 
-    if (!keyConfig) {
-        return res.status(404).json({
-            success: false,
-            message: 'invalid_key'
-        });
-    }
+        const cleanKey = key.trim().toUpperCase();
+        const cleanDeviceId = deviceId.trim();
 
-    db.get(
-        'SELECT * FROM activations WHERE key_id = ? AND device_id = ?',
-        [cleanKey, deviceId],
-        (err, row) => {
-            if (err) {
-                return res.status(500).json({
-                    success: false,
-                    message: 'db_error'
-                });
-            }
+        const keyConfig = secretKeys[cleanKey];
 
-            if (row) {
-                return res.status(400).json({
-                    success: false,
-                    message: 'already_activated_here'
-                });
-            }
+        if (!keyConfig) {
+            return res.status(404).json({
+                success: false,
+                message: 'invalid_key'
+            });
+        }
 
-            db.get(
-                'SELECT COUNT(*) AS count FROM activations WHERE key_id = ?',
-                [cleanKey],
-                (err, result) => {
-                    if (err) {
-                        return res.status(500).json({
-                            success: false,
-                            message: 'db_error'
-                        });
-                    }
+        db.get(
+            `SELECT * FROM activations
+             WHERE key_id = ? AND device_id = ?`,
+            [cleanKey, cleanDeviceId],
+            (err, row) => {
+                if (err) {
+                    console.error('ACTIVATE SELECT:', err);
 
-                    if (result.count >= keyConfig.max_activations) {
-                        return res.status(400).json({
-                            success: false,
-                            message: 'exhausted'
-                        });
-                    }
+                    return res.status(500).json({
+                        success: false,
+                        message: 'db_error'
+                    });
+                }
 
-                    const now = Date.now();
-                    let ms = 30 * 24 * 60 * 60 * 1000;
+                if (row) {
+                    return res.status(400).json({
+                        success: false,
+                        message: 'already_activated_here'
+                    });
+                }
 
-                    if (keyConfig.duration === '7_days')
-                        ms = 7 * 24 * 60 * 60 * 1000;
-                    if (keyConfig.duration === '3_months')
-                        ms = 90 * 24 * 60 * 60 * 1000;
-                    if (keyConfig.duration === '6_months')
-                        ms = 180 * 24 * 60 * 60 * 1000;
-                    if (keyConfig.duration === 'forever')
-                        ms = 3650 * 24 * 60 * 60 * 1000;
+                db.get(
+                    `SELECT COUNT(*) AS count
+                     FROM activations WHERE key_id = ?`,
+                    [cleanKey],
+                    (err, result) => {
+                        if (err) {
+                            console.error('ACTIVATE COUNT:', err);
 
-                    const expires = now + ms;
-
-                    db.run(
-                        `INSERT INTO activations
-                         (key_id, device_id, expires)
-                         VALUES (?, ?, ?)`,
-                        [cleanKey, deviceId, expires],
-                        err => {
-                            if (err) {
-                                return res.status(500).json({
-                                    success: false,
-                                    message: 'db_error'
-                                });
-                            }
-
-                            if (result.count + 1 >= keyConfig.max_activations) {
-                                secretKeys[cleanKey].used = true;
-                            }
-
-                            res.json({
-                                success: true,
-                                message: 'premium_activated',
-                                duration: keyConfig.duration,
-                                expires
+                            return res.status(500).json({
+                                success: false,
+                                message: 'db_error'
                             });
                         }
-                    );
-                }
-            );
-        }
-    );
+
+                        if (
+                            result.count >=
+                            Number(keyConfig.max_activations || 1)
+                        ) {
+                            return res.status(400).json({
+                                success: false,
+                                message: 'exhausted'
+                            });
+                        }
+
+                        const now = Date.now();
+                        let ms = 30 * 24 * 60 * 60 * 1000;
+
+                        if (keyConfig.duration === '7_days') {
+                            ms = 7 * 24 * 60 * 60 * 1000;
+                        }
+
+                        if (keyConfig.duration === '3_months') {
+                            ms = 90 * 24 * 60 * 60 * 1000;
+                        }
+
+                        if (keyConfig.duration === '6_months') {
+                            ms = 180 * 24 * 60 * 60 * 1000;
+                        }
+
+                        if (keyConfig.duration === 'forever') {
+                            ms = 3650 * 24 * 60 * 60 * 1000;
+                        }
+
+                        const expires = now + ms;
+
+                        db.run(
+                            `INSERT INTO activations
+                             (key_id, device_id, expires)
+                             VALUES (?, ?, ?)`,
+                            [cleanKey, cleanDeviceId, expires],
+                            err => {
+                                if (err) {
+                                    console.error('ACTIVATE INSERT:', err);
+
+                                    return res.status(500).json({
+                                        success: false,
+                                        message: 'db_error'
+                                    });
+                                }
+
+                                if (
+                                    result.count + 1 >=
+                                    Number(keyConfig.max_activations || 1)
+                                ) {
+                                    secretKeys[cleanKey].used = true;
+                                }
+
+                                res.json({
+                                    success: true,
+                                    message: 'premium_activated',
+                                    duration: keyConfig.duration,
+                                    expires
+                                });
+                            }
+                        );
+                    }
+                );
+            }
+        );
+    } catch (err) {
+        console.error('ACTIVATE:', err);
+
+        res.status(500).json({
+            success: false,
+            message: 'server_error'
+        });
+    }
 });
 
 // ==========================================
-// 15. ПРОВЕРКА СТАТУСА ПОДПИСКИ
+// 19. ПРОВЕРКА СТАТУСА
 // ==========================================
 
 app.get('/api/status', (req, res) => {
-    const { deviceId } = req.query;
+    const deviceId = String(req.query.deviceId || '').trim();
 
     if (!deviceId) {
-        return res.status(400).json({ active: false });
+        return res.status(400).json({
+            active: false
+        });
     }
 
     db.get(
@@ -993,7 +1149,11 @@ app.get('/api/status', (req, res) => {
         [deviceId],
         (err, row) => {
             if (err) {
-                return res.status(500).json({ active: false });
+                console.error('STATUS:', err);
+
+                return res.status(500).json({
+                    active: false
+                });
             }
 
             if (row && Date.now() < row.expires) {
@@ -1006,21 +1166,73 @@ app.get('/api/status', (req, res) => {
                 });
             }
 
-            res.json({ active: false });
+            res.json({
+                active: false
+            });
         }
     );
 });
 
 // ==========================================
-// 16. ЗАПУСК
+// 20. HEALTH CHECK
 // ==========================================
 
 app.get('/', (req, res) => {
     res.send('ProxyGem API работает ✅');
 });
 
-const PORT = process.env.PORT || 3000;
+app.get('/api/health', async (req, res) => {
+    try {
+        await dbGet('SELECT 1');
 
-app.listen(PORT, () => {
-    console.log(`ProxyGem API запущен на порту ${PORT}`);
+        res.json({
+            success: true,
+            server: true,
+            database: true,
+            mailConfigured: Boolean(mailer),
+            time: new Date().toISOString()
+        });
+    } catch (err) {
+        console.error('HEALTH:', err);
+
+        res.status(500).json({
+            success: false,
+            server: true,
+            database: false
+        });
+    }
 });
+
+// ==========================================
+// 21. ОБРАБОТКА ОШИБОК
+// ==========================================
+
+app.use((err, req, res, next) => {
+    console.error('UNHANDLED ERROR:', err);
+
+    if (res.headersSent) {
+        return next(err);
+    }
+
+    res.status(500).json({
+        success: false,
+        message: 'Внутренняя ошибка сервера'
+    });
+});
+
+// ==========================================
+// 22. ЗАПУСК ПОСЛЕ SQLITE
+// ==========================================
+
+initializeDatabase()
+    .then(() => {
+        app.listen(PORT, '0.0.0.0', () => {
+            console.log(`ProxyGem API запущен на порту ${PORT}`);
+            console.log('База данных готова');
+            console.log('SMTP настроен:', Boolean(mailer));
+        });
+    })
+    .catch(err => {
+        console.error('Не удалось инициализировать базу:', err);
+        process.exit(1);
+    });
