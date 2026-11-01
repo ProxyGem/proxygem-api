@@ -21,12 +21,9 @@ app.get('/health', (req, res) => res.status(200).send('OK'));
 
 // ==========================================
 // 1. ЗАГРУЗКА КЛЮЧЕЙ
-// Приоритет: keys.json рядом со скриптом → env premium_keys → тест
+// Приоритет: keys.json → env premium_keys → тест
 // ==========================================
 let secretKeys = {};
-
-// Ключи, которые нельзя выдавать/активировать (админские/тестовые)
-const BLOCKED_KEYS = new Set(['PROXYGEM']);
 
 function normalizeKeyConfig(cfg) {
     return {
@@ -55,19 +52,13 @@ function loadKeys() {
         const keysArray = Array.isArray(rawData) ? rawData : rawData.codes;
 
         if (Array.isArray(keysArray)) {
-            // Формат: [{id, duration, max_activations, ...}]
             keysArray.forEach(k => {
                 if (!k || !k.id) return;
-                if (BLOCKED_KEYS.has(k.id)) return;
                 secretKeys[k.id] = normalizeKeyConfig(k);
             });
         } else if (rawData && typeof rawData === 'object') {
             // ВАШ ФОРМАТ: { "KEY": {duration, max_activations}, ... }
             for (const [id, cfg] of Object.entries(rawData)) {
-                if (BLOCKED_KEYS.has(id)) {
-                    console.warn(`🚫 Ключ ${id} заблокирован (BLOCKED_KEYS)`);
-                    continue;
-                }
                 secretKeys[id] = normalizeKeyConfig(cfg || {});
             }
         } else {
@@ -75,24 +66,76 @@ function loadKeys() {
         }
 
         console.log(`✅ Загружено ${Object.keys(secretKeys).length} ключей`);
+
+        // Проверка, что PROXYGEM на месте
+        if (secretKeys['PROXYGEM']) {
+            console.log('🎁 Триал PROXYGEM загружен (7 дней на устройство)');
+        } else {
+            console.warn('⚠️ Ключ PROXYGEM не найден в keys.json/premium_keys');
+        }
     } catch (e) {
         console.error('❌ Ошибка загрузки ключей:', e.message);
         secretKeys = {
-            'TEST-KEY-123': { duration: '1_month', max_activations: 1, used: false, gived: false }
+            'TEST-KEY-123': { duration: '1_month', max_activations: 1, used: false, gived: false },
+            'PROXYGEM':     { duration: '7_days',  max_activations: 1, used: false, gived: false }
         };
+        console.log('⚠️ Используются тестовые ключи (включая PROXYGEM)');
     }
 }
 loadKeys();
 
 // ==========================================
-// 2. БАЗА ДАННЫХ
-// На Render обязательно: Render Disk + DB_PATH=/data/database.sqlite
+// 2. БАЗА ДАННЫХ — с безопасным fallback
+// Порядок: env DB_PATH → /tmp → локальная папка
 // ==========================================
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'database.sqlite');
+function ensureDir(filePath) {
+    const dir = path.dirname(filePath);
+    try {
+        if (!fs.existsSync(dir)) {
+            fs.mkdirSync(dir, { recursive: true });
+            console.log(`📂 Создана папка для БД: ${dir}`);
+        }
+    } catch (e) {
+        console.warn(`⚠️ Не удалось создать папку ${dir}: ${e.message}`);
+    }
+}
+
+function pickDbPath() {
+    const candidates = [
+        process.env.DB_PATH,
+        '/tmp/database.sqlite',
+        path.join(__dirname, 'database.sqlite')
+    ].filter(Boolean);
+
+    for (const p of candidates) {
+        try {
+            ensureDir(p);
+            // Проверяем, что можем открыть файл на запись
+            fs.closeSync(fs.openSync(p, 'a'));
+            return p;
+        } catch (e) {
+            console.warn(`⚠️ Путь БД недоступен: ${p} (${e.message})`);
+        }
+    }
+    // В крайнем случае — in-memory (данные не сохраняются, но сервер работает)
+    console.error('❌ Нет доступных путей для БД, использую in-memory');
+    return ':memory:';
+}
+
+const DB_PATH = pickDbPath();
+console.log(`📦 Использую БД: ${DB_PATH}`);
+
 const db = new sqlite3.Database(DB_PATH, (err) => {
-    if (err) console.error('Ошибка БД:', err.message);
-    else console.log('✅ SQLite подключена:', DB_PATH);
+    if (err) {
+        console.error('❌ Ошибка БД:', err.message);
+    } else {
+        console.log('✅ SQLite подключена:', DB_PATH);
+    }
 });
+
+// Включаем WAL для стабильности на слабых дисках
+db.run('PRAGMA journal_mode = WAL;');
+db.run('PRAGMA busy_timeout = 5000;');
 
 db.serialize(() => {
     db.run(`CREATE TABLE IF NOT EXISTS activations (
@@ -109,7 +152,7 @@ db.serialize(() => {
     db.run(`CREATE INDEX IF NOT EXISTS idx_activations_device ON activations(device_id)`);
 });
 
-// --- Восстановление флага gived из БД ---
+// Восстановление gived из БД
 db.all(`SELECT key_id FROM key_status WHERE gived = 1`, (err, rows) => {
     if (err || !rows) return;
     let restored = 0;
@@ -122,13 +165,14 @@ db.all(`SELECT key_id FROM key_status WHERE gived = 1`, (err, rows) => {
     console.log(`✅ Восстановлено gived для ${restored} ключей`);
 });
 
-// --- Восстановление флага used по количеству активаций ---
+// Восстановление used по количеству активаций (кроме PROXYGEM)
 db.all(
     `SELECT key_id, COUNT(*) as cnt FROM activations GROUP BY key_id`,
     (err, rows) => {
         if (err || !rows) return;
         let restored = 0;
         rows.forEach(r => {
+            if (r.key_id === 'PROXYGEM') return;
             const cfg = secretKeys[r.key_id];
             if (cfg && r.cnt >= cfg.max_activations) {
                 cfg.used = true;
@@ -150,6 +194,7 @@ app.post('/api/get-key', (req, res) => {
 
     let foundKey = null;
     for (const [key, data] of Object.entries(secretKeys)) {
+        if (key === 'PROXYGEM') continue; // триал не выдаём через сайт
         if (data.duration === duration && !data.gived && !data.used) {
             foundKey = key;
             break;
@@ -189,6 +234,43 @@ app.post('/api/activate', (req, res) => {
 
     if (!keyConfig) return res.status(404).json({ success: false, message: 'invalid_key' });
 
+    // ===== ТРИАЛ PROXYGEM: один раз на устройство =====
+    if (cleanKey === 'PROXYGEM') {
+        db.get(
+            `SELECT * FROM activations WHERE key_id = ? AND device_id = ?`,
+            [cleanKey, deviceId],
+            (err, row) => {
+                if (err) {
+                    console.error('DB error trial check:', err.message);
+                    return res.status(500).json({ success: false, message: 'db_error' });
+                }
+                if (row) return res.status(400).json({ success: false, message: 'trial_already_used' });
+
+                const expires = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7 дней
+
+                db.run(
+                    `INSERT INTO activations (key_id, device_id, expires) VALUES (?, ?, ?)`,
+                    [cleanKey, deviceId, expires],
+                    (err) => {
+                        if (err) {
+                            console.error('DB error trial insert:', err.message);
+                            return res.status(500).json({ success: false, message: 'db_error' });
+                        }
+                        console.log(`🎁 Триал PROXYGEM активирован на ${deviceId}`);
+                        return res.json({
+                            success: true,
+                            message: 'trial_activated',
+                            duration: '7_days',
+                            expires
+                        });
+                    }
+                );
+            }
+        );
+        return;
+    }
+
+    // ===== ОБЫЧНЫЕ КЛЮЧИ =====
     if (keyConfig.used && keyConfig.max_activations === 1) {
         return res.status(400).json({ success: false, message: 'exhausted' });
     }
@@ -197,17 +279,22 @@ app.post('/api/activate', (req, res) => {
         `SELECT * FROM activations WHERE key_id = ? AND device_id = ?`,
         [cleanKey, deviceId],
         (err, row) => {
-            if (err) return res.status(500).json({ success: false, message: 'db_error' });
+            if (err) {
+                console.error('DB error check:', err.message);
+                return res.status(500).json({ success: false, message: 'db_error' });
+            }
             if (row) return res.status(400).json({ success: false, message: 'already_activated_here' });
 
             db.get(
                 `SELECT COUNT(*) as count FROM activations WHERE key_id = ?`,
                 [cleanKey],
                 (err, result) => {
-                    if (err) return res.status(500).json({ success: false, message: 'db_error' });
+                    if (err) {
+                        console.error('DB error count:', err.message);
+                        return res.status(500).json({ success: false, message: 'db_error' });
+                    }
 
                     if (result.count >= keyConfig.max_activations) {
-                        // на всякий случай синхронизируем память
                         secretKeys[cleanKey].used = true;
                         return res.status(400).json({ success: false, message: 'exhausted' });
                     }
@@ -224,7 +311,10 @@ app.post('/api/activate', (req, res) => {
                         `INSERT INTO activations (key_id, device_id, expires) VALUES (?, ?, ?)`,
                         [cleanKey, deviceId, expires],
                         (err) => {
-                            if (err) return res.status(500).json({ success: false, message: 'db_error' });
+                            if (err) {
+                                console.error('DB error insert:', err.message);
+                                return res.status(500).json({ success: false, message: 'db_error' });
+                            }
 
                             if (result.count + 1 >= keyConfig.max_activations) {
                                 secretKeys[cleanKey].used = true;
@@ -253,7 +343,10 @@ app.get('/api/status', (req, res) => {
         `SELECT * FROM activations WHERE device_id = ? ORDER BY expires DESC LIMIT 1`,
         [deviceId],
         (err, row) => {
-            if (err) return res.status(500).json({ active: false });
+            if (err) {
+                console.error('DB error status:', err.message);
+                return res.status(500).json({ active: false });
+            }
             if (row && Date.now() < row.expires) {
                 const keyConfig = secretKeys[row.key_id] || {};
                 return res.json({
@@ -277,7 +370,6 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Сервер запущен на порту ${PORT}`);
 });
 
-// Graceful shutdown (Render шлёт SIGTERM)
 process.on('SIGTERM', () => {
     console.log('SIGTERM, закрываю БД...');
     db.close(() => process.exit(0));
