@@ -23,6 +23,9 @@ app.get('/health', (req, res) => res.status(200).send('OK'));
 const PUBLIC_URL = (process.env.PUBLIC_URL || '').replace(/\/+$/, '') || null;
 const SITE_URL = (process.env.SITE_URL || '').replace(/\/+$/, '') || null;
 
+// FIX: жёсткий fallback — если SITE_URL не задан, всё равно уходим на сайт
+const FALLBACK_SITE = SITE_URL || 'https://proxygem.github.io/site/profile';
+
 const ALLOWED_RETURN_HOSTS = [
     'proxygem.github.io',
     'proxygem-api.onrender.com',
@@ -31,22 +34,19 @@ const ALLOWED_RETURN_HOSTS = [
 ];
 
 function normalizeReturnUrl(input) {
-    if (!input) return SITE_URL || '/';
+    if (!input) return FALLBACK_SITE;
     let raw = String(input).trim();
-    if (raw.startsWith('/')) {
-        if (SITE_URL) return SITE_URL + raw;
-        return raw;
-    }
+    if (raw.startsWith('/')) return FALLBACK_SITE.replace(/\/+$/, '') + raw;
     try {
         const u = new URL(raw);
         if (!ALLOWED_RETURN_HOSTS.includes(u.hostname)) {
-            console.warn('⚠️ return URL не в whitelist:', u.hostname, '→ fallback:', SITE_URL || '/');
-            return SITE_URL || '/';
+            console.warn('⚠️ return URL не в whitelist:', u.hostname, '→ fallback:', FALLBACK_SITE);
+            return FALLBACK_SITE;
         }
         return u.toString();
     } catch (e) {
-        console.warn('⚠️ Невалидный return URL:', raw, '→ fallback:', SITE_URL || '/');
-        return SITE_URL || '/';
+        console.warn('⚠️ Невалидный return URL:', raw, '→ fallback:', FALLBACK_SITE);
+        return FALLBACK_SITE;
     }
 }
 
@@ -75,32 +75,22 @@ function loadKeys() {
         const filePath = path.join(__dirname, 'keys.json');
         if (fs.existsSync(filePath)) {
             rawData = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-            console.log('📁 Ключи загружены из keys.json');
+            console.log('📁 Ключи из keys.json');
         } else if (process.env.premium_keys) {
             rawData = JSON.parse(process.env.premium_keys);
-            console.log('🌍 Ключи загружены из env premium_keys');
+            console.log('🌍 Ключи из env');
         } else {
             throw new Error('Нет ни keys.json, ни premium_keys');
         }
-
         const keysArray = Array.isArray(rawData) ? rawData : rawData.codes;
         if (Array.isArray(keysArray)) {
-            keysArray.forEach(k => {
-                if (!k || !k.id) return;
-                secretKeys[k.id] = normalizeKeyConfig(k);
-            });
+            keysArray.forEach(k => { if (k && k.id) secretKeys[k.id] = normalizeKeyConfig(k); });
         } else if (rawData && typeof rawData === 'object') {
-            for (const [id, cfg] of Object.entries(rawData)) {
-                secretKeys[id] = normalizeKeyConfig(cfg || {});
-            }
-        } else {
-            throw new Error('Неизвестный формат ключей');
-        }
-        console.log(`✅ Загружено ${Object.keys(secretKeys).length} ключей`);
-        if (secretKeys['PROXYGEM']) console.log('🎁 Триал PROXYGEM загружен');
-        else console.warn('⚠️ Ключ PROXYGEM не найден');
+            for (const [id, cfg] of Object.entries(rawData)) secretKeys[id] = normalizeKeyConfig(cfg || {});
+        } else throw new Error('Неизвестный формат');
+        console.log(`✅ Ключей: ${Object.keys(secretKeys).length}`);
     } catch (e) {
-        console.error('❌ Ошибка загрузки ключей:', e.message);
+        console.error('❌ Ключи:', e.message);
         secretKeys = {
             'TEST-KEY-123': { duration: '1_month', max_activations: 1, used: false, gived: false },
             'PROXYGEM':     { duration: '7_days',  max_activations: 1, used: false, gived: false }
@@ -127,8 +117,8 @@ const DB_PATH = pickDbPath();
 console.log(`📦 БД: ${DB_PATH}`);
 
 const db = new sqlite3.Database(DB_PATH, (err) => {
-    if (err) console.error('❌ Ошибка БД:', err.message);
-    else console.log('✅ SQLite подключена');
+    if (err) console.error('❌ БД:', err.message);
+    else console.log('✅ SQLite OK');
 });
 db.run('PRAGMA journal_mode = WAL;');
 db.run('PRAGMA busy_timeout = 5000;');
@@ -139,24 +129,39 @@ db.serialize(() => {
     db.run(`CREATE TABLE IF NOT EXISTS key_status (key_id TEXT PRIMARY KEY, gived INTEGER DEFAULT 0)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_activations_key ON activations(key_id)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_activations_device ON activations(device_id)`);
+    db.run(`CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, login TEXT UNIQUE NOT NULL,
+        password_hash TEXT, nick TEXT, avatar TEXT, banner TEXT,
+        created_at INTEGER NOT NULL, last_login INTEGER)`);
+    db.run(`CREATE TABLE IF NOT EXISTS sessions (
+        token TEXT PRIMARY KEY, user_id INTEGER NOT NULL,
+        created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)`);
+    db.run(`CREATE TABLE IF NOT EXISTS user_providers (
+        user_id INTEGER NOT NULL, provider TEXT NOT NULL, provider_id TEXT,
+        UNIQUE(user_id, provider))`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)`);
+    // FIX: одна таблица для state (Telegram + Google)
+    db.run(`CREATE TABLE IF NOT EXISTS oauth_state (
+        state TEXT PRIMARY KEY, verifier TEXT, return_url TEXT NOT NULL,
+        provider TEXT NOT NULL, expires_at INTEGER NOT NULL)`);
 });
 
 db.all(`SELECT key_id FROM key_status WHERE gived = 1`, (err, rows) => {
     if (err || !rows) return;
-    let restored = 0;
-    rows.forEach(r => { if (secretKeys[r.key_id]) { secretKeys[r.key_id].gived = true; restored++; } });
-    console.log(`✅ gived восстановлено: ${restored}`);
+    let n = 0;
+    rows.forEach(r => { if (secretKeys[r.key_id]) { secretKeys[r.key_id].gived = true; n++; } });
+    console.log(`✅ gived: ${n}`);
 });
 
 db.all(`SELECT key_id, COUNT(*) as cnt FROM activations GROUP BY key_id`, (err, rows) => {
     if (err || !rows) return;
-    let restored = 0;
+    let n = 0;
     rows.forEach(r => {
         if (r.key_id === 'PROXYGEM') return;
         const cfg = secretKeys[r.key_id];
-        if (cfg && r.cnt >= cfg.max_activations) { cfg.used = true; restored++; }
+        if (cfg && r.cnt >= cfg.max_activations) { cfg.used = true; n++; }
     });
-    console.log(`✅ used восстановлено: ${restored}`);
+    console.log(`✅ used: ${n}`);
 });
 
 // ==========================================
@@ -170,7 +175,7 @@ app.post('/api/get-key', (req, res) => {
         if (key === 'PROXYGEM') continue;
         if (data.duration === duration && !data.gived && !data.used) { foundKey = key; break; }
     }
-    if (!foundKey) return res.status(404).json({ success: false, message: 'Нет свободных ключей' });
+    if (!foundKey) return res.status(404).json({ success: false, message: 'Нет ключей' });
     db.run(`INSERT OR REPLACE INTO key_status (key_id, gived) VALUES (?, 1)`, [foundKey], (err) => {
         if (err) return res.status(500).json({ success: false, message: 'db_error' });
         secretKeys[foundKey].gived = true;
@@ -183,7 +188,7 @@ app.post('/api/get-key', (req, res) => {
 // ==========================================
 app.post('/api/activate', (req, res) => {
     const { key, deviceId } = req.body || {};
-    if (!key || !deviceId) return res.status(400).json({ success: false, message: 'Не переданы данные' });
+    if (!key || !deviceId) return res.status(400).json({ success: false, message: 'Нет данных' });
     const cleanKey = String(key).trim().toUpperCase();
     const keyConfig = secretKeys[cleanKey];
     if (!keyConfig) return res.status(404).json({ success: false, message: 'invalid_key' });
@@ -243,25 +248,8 @@ app.get('/api/status', (req, res) => {
 });
 
 // ==========================================
-// 6. АУТЕНТИФИКАЦИЯ И ПРОФИЛЬ
+// 6. АУТЕНТИФИКАЦИЯ
 // ==========================================
-db.serialize(() => {
-    db.run(`CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, login TEXT UNIQUE NOT NULL,
-        password_hash TEXT, nick TEXT, avatar TEXT, banner TEXT,
-        created_at INTEGER NOT NULL, last_login INTEGER)`);
-    db.run(`CREATE TABLE IF NOT EXISTS sessions (
-        token TEXT PRIMARY KEY, user_id INTEGER NOT NULL,
-        created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)`);
-    db.run(`CREATE TABLE IF NOT EXISTS user_providers (
-        user_id INTEGER NOT NULL, provider TEXT NOT NULL, provider_id TEXT,
-        UNIQUE(user_id, provider))`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)`);
-    db.run(`CREATE TABLE IF NOT EXISTS tg_pkce (
-        state TEXT PRIMARY KEY, verifier TEXT NOT NULL,
-        return_url TEXT NOT NULL, expires_at INTEGER NOT NULL)`);
-});
-
 function genToken() { return crypto.randomBytes(32).toString('hex'); }
 function authUser(req) {
     const h = req.headers.authorization || '';
@@ -295,6 +283,26 @@ function getUserProviders(userId) {
         });
     });
 }
+function createSession(userId) {
+    return new Promise((resolve) => {
+        const token = genToken();
+        const expires = Date.now() + 30 * 24 * 60 * 60 * 1000;
+        db.run(`INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
+            [token, userId, Date.now(), expires], (err) => resolve(err ? null : token));
+    });
+}
+function redirectToSite(res, siteUrl, token, provider) {
+    const sep = siteUrl.includes('?') ? '&' : '?';
+    const url = `${siteUrl}${sep}token=${encodeURIComponent(token)}&provider=${encodeURIComponent(provider)}`;
+    console.log('🔹 REDIRECT →', url);
+    res.redirect(url);
+}
+function redirectToSiteError(res, siteUrl, code) {
+    const sep = siteUrl.includes('?') ? '&' : '?';
+    const url = `${siteUrl}${sep}error=${encodeURIComponent(code)}`;
+    console.log('🔹 REDIRECT ERROR →', url);
+    res.redirect(url);
+}
 
 app.post('/auth/register', async (req, res) => {
     try {
@@ -318,15 +326,12 @@ app.post('/auth/register', async (req, res) => {
                         return res.status(500).json({ message: 'db_error' });
                     }
                     const userId = this.lastID;
-                    const token = genToken();
-                    const expires = Date.now() + 30 * 24 * 60 * 60 * 1000;
-                    db.run(`INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
-                        [token, userId, Date.now(), expires], (err3) => {
-                            if (err3) return res.status(500).json({ message: 'session_error' });
-                            db.get(`SELECT * FROM users WHERE id = ?`, [userId], (e, u) => {
-                                res.json({ token, user: publicUser(u) });
-                            });
+                    createSession(userId).then(token => {
+                        if (!token) return res.status(500).json({ message: 'session_error' });
+                        db.get(`SELECT * FROM users WHERE id = ?`, [userId], (e, u) => {
+                            res.json({ token, user: publicUser(u) });
                         });
+                    });
                 });
         });
     } catch (e) { res.status(500).json({ message: 'server_error' }); }
@@ -342,14 +347,11 @@ app.post('/auth/login', (req, res) => {
         if (!u || !u.password_hash) return res.status(401).json({ message: 'Неверный логин или пароль' });
         const ok = await bcrypt.compare(pass, u.password_hash);
         if (!ok) return res.status(401).json({ message: 'Неверный логин или пароль' });
-        const token = genToken();
-        const expires = Date.now() + 30 * 24 * 60 * 60 * 1000;
-        db.run(`INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
-            [token, u.id, Date.now(), expires], (e2) => {
-                if (e2) return res.status(500).json({ message: 'session_error' });
-                db.run(`UPDATE users SET last_login = ? WHERE id = ?`, [Date.now(), u.id]);
-                res.json({ token, user: publicUser(u) });
-            });
+        createSession(u.id).then(token => {
+            if (!token) return res.status(500).json({ message: 'session_error' });
+            db.run(`UPDATE users SET last_login = ? WHERE id = ?`, [Date.now(), u.id]);
+            res.json({ token, user: publicUser(u) });
+        });
     });
 });
 
@@ -459,10 +461,10 @@ app.get('/auth/telegram/start', (req, res) => {
     const challenge = base64url(crypto.createHash('sha256').update(verifier).digest());
     const state = crypto.randomBytes(16).toString('hex');
 
-    db.run(`INSERT OR REPLACE INTO tg_pkce (state, verifier, return_url, expires_at) VALUES (?, ?, ?, ?)`,
+    db.run(`INSERT OR REPLACE INTO oauth_state (state, verifier, return_url, provider, expires_at) VALUES (?, ?, ?, 'telegram', ?)`,
         [state, verifier, returnUrl, Date.now() + 10 * 60 * 1000], (err) => {
-            if (err) { console.error('tg_pkce:', err.message); return res.status(500).send('state_store_error'); }
-            db.run(`DELETE FROM tg_pkce WHERE expires_at < ?`, [Date.now()]);
+            if (err) { console.error('oauth_state:', err.message); return res.status(500).send('state_error'); }
+            db.run(`DELETE FROM oauth_state WHERE expires_at < ?`, [Date.now()]);
             const params = querystring.stringify({
                 client_id: clientId, redirect_uri: redirectUri,
                 response_type: 'code', scope: 'openid profile',
@@ -474,28 +476,22 @@ app.get('/auth/telegram/start', (req, res) => {
 });
 
 app.get('/auth/telegram/callback', async (req, res) => {
+    const site = FALLBACK_SITE;
     try {
         const { code, state, error } = req.query;
-        const fallback = SITE_URL || '/';
-        const sep = fallback.includes('?') ? '&' : '?';
-
-        if (error) return res.redirect(`${fallback}${sep}error=${encodeURIComponent(error)}&provider=telegram`);
-        if (!code || !state) return res.redirect(`${fallback}${sep}error=missing_code&provider=telegram`);
+        if (error) return redirectToSiteError(res, site, 'telegram_' + error);
+        if (!code || !state) return redirectToSiteError(res, site, 'missing_code');
 
         const stored = await new Promise((resolve) => {
-            db.get(`SELECT * FROM tg_pkce WHERE state = ? AND expires_at > ?`, [state, Date.now()],
+            db.get(`SELECT * FROM oauth_state WHERE state = ? AND expires_at > ?`, [state, Date.now()],
                 (err, row) => resolve(err ? null : row));
         });
-
-        if (!stored) {
-            console.warn('⚠️ TG state не найден:', state);
-            return res.redirect(`${fallback}${sep}error=state_expired&provider=telegram`);
-        }
-        db.run(`DELETE FROM tg_pkce WHERE state = ?`, [state]);
+        if (!stored) { console.warn('⚠️ state not found:', state); return redirectToSiteError(res, site, 'state_expired'); }
+        db.run(`DELETE FROM oauth_state WHERE state = ?`, [state]);
 
         const clientId = process.env.TG_CLIENT_ID;
         const clientSecret = process.env.TG_CLIENT_SECRET;
-        if (!clientId || !clientSecret) return res.status(500).send('Telegram OIDC not configured');
+        if (!clientId || !clientSecret) return redirectToSiteError(res, site, 'server_config');
 
         const origin = serverOrigin(req);
         const redirectUri = `${origin}/auth/telegram/callback`;
@@ -514,43 +510,31 @@ app.get('/auth/telegram/callback', async (req, res) => {
         });
 
         const { id_token } = tokenRes.data;
-        if (!id_token) return res.redirect(`${fallback}${sep}error=no_id_token&provider=telegram`);
+        if (!id_token) return redirectToSiteError(res, site, 'no_id_token');
 
         const { payload } = await jwtVerify(id_token, TG_JWKS, {
             issuer: TG_ISSUER, audience: clientId
         });
 
-        // FIX: ник = @username (или имя+фамилия), аватар = photo_url
         const providerId = String(payload.id || payload.sub);
         const username = payload.preferred_username || null;
         const displayNick = username
             ? (username.startsWith('@') ? username : '@' + username)
-            : [payload.given_name, payload.family_name].filter(Boolean).join(' ') || (payload.name || 'tg_' + providerId);
-        const login = (username || 'tg_' + providerId)
-            .replace(/[^A-Za-z0-9_.\-]/g, '_').slice(0, 24) || ('tg_' + providerId);
+            : ([payload.given_name, payload.family_name].filter(Boolean).join(' ') || payload.name || 'tg_' + providerId);
+        const login = (username || 'tg_' + providerId).replace(/[^A-Za-z0-9_.\-]/g, '_').slice(0, 24) || ('tg_' + providerId);
         const avatar = payload.picture || null;
 
         db.get(`SELECT u.* FROM user_providers p JOIN users u ON u.id = p.user_id
-                WHERE p.provider = 'telegram' AND p.provider_id = ?`, [providerId], (err, existing) => {
-            if (err) return res.redirect(`${fallback}${sep}error=db_error&provider=telegram`);
-
-            const finish = (user) => {
-                const token = genToken();
-                const expires = Date.now() + 30 * 24 * 60 * 60 * 1000;
-                db.run(`INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
-                    [token, user.id, Date.now(), expires], () => {
-                        const target = stored.return_url || fallback;
-                        const s = target.includes('?') ? '&' : '?';
-                        console.log('🔹 TG finish →', target);
-                        res.redirect(`${target}${s}token=${token}&provider=telegram`);
-                    });
-            };
+                WHERE p.provider = 'telegram' AND p.provider_id = ?`, [providerId], async (err, existing) => {
+            if (err) return redirectToSiteError(res, site, 'db_error');
 
             if (existing) {
-                // обновляем ник/аватар из Telegram при каждом входе
                 db.run(`UPDATE users SET nick = ?, avatar = ?, last_login = ? WHERE id = ?`,
-                    [displayNick, avatar, Date.now(), existing.id], () => {
-                        db.get(`SELECT * FROM users WHERE id = ?`, [existing.id], (e, u) => finish(u || existing));
+                    [displayNick, avatar, Date.now(), existing.id], async () => {
+                        const token = await createSession(existing.id);
+                        if (!token) return redirectToSiteError(res, site, 'session_error');
+                        const target = normalizeReturnUrl(stored.return_url);
+                        redirectToSite(res, target, token, 'telegram');
                     });
                 return;
             }
@@ -562,28 +546,28 @@ app.get('/auth/telegram/callback', async (req, res) => {
                     [tryLogin, displayNick, avatar, now, now], function (e2) {
                         if (e2) {
                             if (String(e2.message).includes('UNIQUE') && attempt < 3) return tryInsert(attempt + 1);
-                            return res.redirect(`${fallback}${sep}error=db_error&provider=telegram`);
+                            return redirectToSiteError(res, site, 'db_error');
                         }
                         const userId = this.lastID;
                         db.run(`INSERT OR IGNORE INTO user_providers (user_id, provider, provider_id) VALUES (?, 'telegram', ?)`,
-                            [userId, providerId]);
-                        db.get(`SELECT * FROM users WHERE id = ?`, [userId], (e3, nu) => finish(nu));
+                            [userId, providerId], async () => {
+                                const token = await createSession(userId);
+                                if (!token) return redirectToSiteError(res, site, 'session_error');
+                                const target = normalizeReturnUrl(stored.return_url);
+                                redirectToSite(res, target, token, 'telegram');
+                            });
                     });
             };
             tryInsert(0);
         });
     } catch (e) {
         console.error('telegram callback:', e.response ? e.response.data : e.message);
-        const fallback = SITE_URL || '/';
-        const sep = fallback.includes('?') ? '&' : '?';
-        res.redirect(`${fallback}${sep}error=telegram_error&provider=telegram`);
+        redirectToSiteError(res, site, 'telegram_error');
     }
 });
 
 // ==========================================
 // GOOGLE — только CLIENT_ID (implicit flow)
-// FIX: state больше не содержит returnUrl — returnUrl уже в sessionStorage на сайте.
-// Сервер всегда возвращает на SITE_URL.
 // ==========================================
 app.get('/auth/google/start', (req, res) => {
     const clientId = process.env.GOOGLE_CLIENT_ID;
@@ -593,14 +577,11 @@ app.get('/auth/google/start', (req, res) => {
     const origin = serverOrigin(req);
     const redirectUri = `${origin}/auth/google/callback`;
 
-    // FIX: state = случайный идентификатор (без URL внутри).
-    // Возврат на сайт задан через SITE_URL.
     const state = crypto.randomBytes(16).toString('hex');
 
-    // Сохраняем state → returnUrl в tg_pkce-подобной таблице (переиспользуем)
-    db.run(`INSERT OR REPLACE INTO tg_pkce (state, verifier, return_url, expires_at) VALUES (?, ?, ?, ?)`,
-        [state, 'google', returnUrl, Date.now() + 10 * 60 * 1000], (err) => {
-            if (err) console.error('google state:', err.message);
+    db.run(`INSERT OR REPLACE INTO oauth_state (state, verifier, return_url, provider, expires_at) VALUES (?, ?, ?, 'google', ?)`,
+        [state, null, returnUrl, Date.now() + 10 * 60 * 1000], (err) => {
+            if (err) { console.error('oauth_state:', err.message); return res.status(500).send('state_error'); }
             const params = querystring.stringify({
                 client_id: clientId, redirect_uri: redirectUri,
                 response_type: 'token', scope: 'openid email profile',
@@ -613,9 +594,11 @@ app.get('/auth/google/start', (req, res) => {
 
 app.get('/auth/google/callback', (req, res) => {
     const { state, error } = req.query;
-    if (error) return res.status(400).send('google_error: ' + error);
+    if (error) return redirectToSiteError(res, FALLBACK_SITE, 'google_' + error);
 
+    const site = FALLBACK_SITE;
     const safeState = JSON.stringify(String(state || ''));
+    const safeSite = JSON.stringify(site);
     res.type('html').send(`<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Google…</title>
 <style>body{background:#040404;color:#fff;font-family:Inter,system-ui,sans-serif;
@@ -624,23 +607,23 @@ display:grid;place-items:center;height:100vh;margin:0}
 <body><div class="m">Завершаем вход через Google…</div>
 <script>
 (function(){
+  var site = ${safeSite};
   var state = ${safeState};
   var hash = new URLSearchParams(location.hash.replace(/^#/, ''));
   var accessToken = hash.get('access_token');
   var err = hash.get('error');
-  if(err){ location.replace(${JSON.stringify(SITE_URL || '/')} + '?error=' + encodeURIComponent(err) + '&provider=google'); return; }
-  if(!accessToken){ location.replace(${JSON.stringify(SITE_URL || '/')} + '?error=no_token&provider=google'); return; }
+  if(err){ location.replace(site + '?error=' + encodeURIComponent('google_' + err)); return; }
+  if(!accessToken){ location.replace(site + '?error=no_token'); return; }
   fetch('/auth/google/exchange', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
+    method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({ access_token: accessToken, state: state })
   })
   .then(function(r){ return r.json().then(function(d){ return {ok:r.ok, d:d}; }); })
   .then(function(x){
-    if(!x.ok){ location.replace(${JSON.stringify(SITE_URL || '/')} + '?error=' + encodeURIComponent(x.d&&x.d.message||'unknown') + '&provider=google'); return; }
+    if(!x.ok){ location.replace(site + '?error=' + encodeURIComponent(x.d&&x.d.message||'unknown')); return; }
     location.replace(x.d.redirect);
   })
-  .catch(function(e){ location.replace(${JSON.stringify(SITE_URL || '/')} + '?error=' + encodeURIComponent(e.message) + '&provider=google'); });
+  .catch(function(e){ location.replace(site + '?error=' + encodeURIComponent(e.message)); });
 })();
 </script></body></html>`);
 });
@@ -659,44 +642,35 @@ app.post('/auth/google/exchange', async (req, res) => {
         } catch (e) {
             return res.status(401).json({ message: 'Неверный Google токен' });
         }
-        if (!info || !info.sub) return res.status(401).json({ message: 'Google userinfo пуст' });
+        if (!info || !info.sub) return res.status(401).json({ message: 'userinfo пуст' });
 
-        // FIX: returnUrl берём из БД по state (а не из state)
-        let returnUrl = SITE_URL || '/';
+        let returnUrl = FALLBACK_SITE;
         if (state) {
             const row = await new Promise((resolve) => {
-                db.get(`SELECT * FROM tg_pkce WHERE state = ? AND expires_at > ?`,
+                db.get(`SELECT * FROM oauth_state WHERE state = ? AND expires_at > ?`,
                     [state, Date.now()], (err, r) => resolve(err ? null : r));
             });
             if (row) {
                 returnUrl = normalizeReturnUrl(row.return_url);
-                db.run(`DELETE FROM tg_pkce WHERE state = ?`, [state]);
+                db.run(`DELETE FROM oauth_state WHERE state = ?`, [state]);
             }
         }
 
         const providerId = String(info.sub);
-        // FIX: ник = "Имя Фамилия", аватар = picture
         const displayNick = info.name || [info.given_name, info.family_name].filter(Boolean).join(' ') || info.email || ('g_' + providerId);
         const avatar = info.picture || null;
 
         db.get(`SELECT u.* FROM user_providers p JOIN users u ON u.id = p.user_id
-                WHERE p.provider = 'google' AND p.provider_id = ?`, [providerId], (err, existing) => {
+                WHERE p.provider = 'google' AND p.provider_id = ?`, [providerId], async (err, existing) => {
             if (err) return res.status(500).json({ message: 'db_error' });
-
-            const finish = (user) => {
-                const token = genToken();
-                const expires = Date.now() + 30 * 24 * 60 * 60 * 1000;
-                db.run(`INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
-                    [token, user.id, Date.now(), expires], () => {
-                        const sep = returnUrl.includes('?') ? '&' : '?';
-                        res.json({ redirect: `${returnUrl}${sep}token=${token}&provider=google` });
-                    });
-            };
 
             if (existing) {
                 db.run(`UPDATE users SET nick = ?, avatar = ?, last_login = ? WHERE id = ?`,
-                    [displayNick, avatar, Date.now(), existing.id], () => {
-                        db.get(`SELECT * FROM users WHERE id = ?`, [existing.id], (e, u) => finish(u || existing));
+                    [displayNick, avatar, Date.now(), existing.id], async () => {
+                        const token = await createSession(existing.id);
+                        if (!token) return res.status(500).json({ message: 'session_error' });
+                        const sep = returnUrl.includes('?') ? '&' : '?';
+                        res.json({ redirect: `${returnUrl}${sep}token=${token}&provider=google` });
                     });
                 return;
             }
@@ -714,8 +688,12 @@ app.post('/auth/google/exchange', async (req, res) => {
                         }
                         const userId = this.lastID;
                         db.run(`INSERT OR IGNORE INTO user_providers (user_id, provider, provider_id) VALUES (?, 'google', ?)`,
-                            [userId, providerId]);
-                        db.get(`SELECT * FROM users WHERE id = ?`, [userId], (e3, nu) => finish(nu));
+                            [userId, providerId], async () => {
+                                const token = await createSession(userId);
+                                if (!token) return res.status(500).json({ message: 'session_error' });
+                                const sep = returnUrl.includes('?') ? '&' : '?';
+                                res.json({ redirect: `${returnUrl}${sep}token=${token}&provider=google` });
+                            });
                     });
             };
             tryInsert(0);
@@ -743,9 +721,9 @@ app.get('/', (req, res) => res.send('ProxyGem API работает ✅'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Сервер на порту ${PORT}`);
+    console.log(`🚀 Порт ${PORT}`);
     console.log(`   PUBLIC_URL = ${PUBLIC_URL || '(auto)'}`);
-    console.log(`   SITE_URL   = ${SITE_URL || '(not set)'}`);
+    console.log(`   SITE_URL   = ${SITE_URL || '(не задан → fallback ' + FALLBACK_SITE + ')'}`);
 });
 
 process.on('SIGTERM', () => {
