@@ -24,6 +24,52 @@ app.use(express.json({ limit: '2mb' }));
 
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
+// Публичный адрес сервера (для redirect_uri в OAuth).
+// На Render задайте PUBLIC_URL = https://proxygem-api.onrender.com
+const PUBLIC_URL = (process.env.PUBLIC_URL || '').replace(/\/+$/, '') || null;
+
+// Куда возвращать пользователя после OAuth.
+// На Render задайте SITE_URL = https://proxygem.github.io/site/profile
+const SITE_URL = (process.env.SITE_URL || '').replace(/\/+$/, '') || null;
+
+// Whitelist разрешённых return-адресов
+const ALLOWED_RETURN_HOSTS = [
+    'proxygem.github.io',
+    'proxygem-api.onrender.com',
+    'localhost',
+    '127.0.0.1'
+];
+
+function normalizeReturnUrl(input) {
+    // 1) Если пусто — на сайт
+    if (!input) return SITE_URL || '/';
+    let raw = String(input).trim();
+
+    // 2) Если пришёл относительный путь — приклеиваем сайт
+    if (raw.startsWith('/')) {
+        if (SITE_URL) return SITE_URL + raw;
+        return raw;
+    }
+
+    // 3) Абсолютный URL — проверяем хост
+    try {
+        const u = new URL(raw);
+        if (!ALLOWED_RETURN_HOSTS.includes(u.hostname)) {
+            console.warn('⚠️ return URL не в whitelist:', u.hostname, '→ fallback:', SITE_URL || '/');
+            return SITE_URL || '/';
+        }
+        return u.toString();
+    } catch (e) {
+        console.warn('⚠️ Невалидный return URL:', raw, '→ fallback:', SITE_URL || '/');
+        return SITE_URL || '/';
+    }
+}
+
+function serverOrigin(req) {
+    if (PUBLIC_URL) return PUBLIC_URL;
+    return 'https://' + req.get('host');
+}
+
 // ==========================================
 // 1. ЗАГРУЗКА КЛЮЧЕЙ
 // ==========================================
@@ -381,6 +427,13 @@ db.serialize(() => {
         UNIQUE(user_id, provider)
     )`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)`);
+    // PKCE-хранилище в БД (переживает рестарт Render)
+    db.run(`CREATE TABLE IF NOT EXISTS tg_pkce (
+        state TEXT PRIMARY KEY,
+        verifier TEXT NOT NULL,
+        return_url TEXT NOT NULL,
+        expires_at INTEGER NOT NULL
+    )`);
 });
 
 function genToken() {
@@ -608,9 +661,6 @@ app.post('/profile/upload', requireAuth, upload.single('file'), (req, res) => {
 const TG_ISSUER = 'https://oauth.telegram.org';
 const TG_JWKS = createRemoteJWKSet(new URL(TG_ISSUER + '/.well-known/jwks.json'));
 
-// Временное хранилище PKCE (в памяти). Для продакшена лучше SQLite/Redis.
-const tgPkceStore = new Map(); // state -> { verifier, redirect, expires }
-
 function base64url(buf) {
     return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
@@ -619,37 +669,42 @@ app.get('/auth/telegram/start', (req, res) => {
     const clientId = process.env.TG_CLIENT_ID;
     if (!clientId) return res.status(500).send('TG_CLIENT_ID not set');
 
-    const redirect = req.query.redirect || '/';
-    const origin = 'https://' + req.get('host');
+    const returnUrl = normalizeReturnUrl(req.query.redirect);
+    const origin = serverOrigin(req);
     const redirectUri = `${origin}/auth/telegram/callback`;
 
-    // PKCE
     const verifier = base64url(crypto.randomBytes(32));
     const challenge = base64url(crypto.createHash('sha256').update(verifier).digest());
     const state = crypto.randomBytes(16).toString('hex');
+    const expiresAt = Date.now() + 10 * 60 * 1000;
 
-    tgPkceStore.set(state, {
-        verifier,
-        redirect,
-        expires: Date.now() + 10 * 60 * 1000
-    });
+    // Сохраняем PKCE в БД (переживает рестарт Render)
+    db.run(
+        `INSERT OR REPLACE INTO tg_pkce (state, verifier, return_url, expires_at) VALUES (?, ?, ?, ?)`,
+        [state, verifier, returnUrl, expiresAt],
+        (err) => {
+            if (err) {
+                console.error('tg_pkce insert:', err.message);
+                return res.status(500).send('state_store_error');
+            }
 
-    // Чистим старые
-    for (const [k, v] of tgPkceStore) {
-        if (v.expires < Date.now()) tgPkceStore.delete(k);
-    }
+            // Очистка старых записей
+            db.run(`DELETE FROM tg_pkce WHERE expires_at < ?`, [Date.now()]);
 
-    const params = querystring.stringify({
-        client_id: clientId,
-        redirect_uri: redirectUri,
-        response_type: 'code',
-        scope: 'openid profile',
-        state,
-        code_challenge: challenge,
-        code_challenge_method: 'S256'
-    });
+            const params = querystring.stringify({
+                client_id: clientId,
+                redirect_uri: redirectUri,
+                response_type: 'code',
+                scope: 'openid profile',
+                state,
+                code_challenge: challenge,
+                code_challenge_method: 'S256'
+            });
 
-    res.redirect(`${TG_ISSUER}/auth?${params}`);
+            console.log('🔹 TG start:', { redirectUri, returnUrl, state: state.slice(0, 8) + '…' });
+            res.redirect(`${TG_ISSUER}/auth?${params}`);
+        }
+    );
 });
 
 app.get('/auth/telegram/callback', async (req, res) => {
@@ -659,18 +714,33 @@ app.get('/auth/telegram/callback', async (req, res) => {
         if (error) return res.status(400).send('Telegram error: ' + error);
         if (!code || !state) return res.status(400).send('Missing code or state');
 
-        const stored = tgPkceStore.get(state);
-        if (!stored) return res.status(400).send('Invalid state (expired or reused)');
-        tgPkceStore.delete(state);
+        // Достаём PKCE-запись из БД
+        const stored = await new Promise((resolve) => {
+            db.get(
+                `SELECT * FROM tg_pkce WHERE state = ? AND expires_at > ?`,
+                [state, Date.now()],
+                (err, row) => resolve(err ? null : row)
+            );
+        });
+
+        if (!stored) {
+            console.warn('⚠️ TG callback: state не найден или истёк:', state);
+            // На всякий случай — отправим на сайт с ошибкой
+            const fallback = SITE_URL || '/';
+            const sep = fallback.includes('?') ? '&' : '?';
+            return res.redirect(`${fallback}${sep}error=state_expired&provider=telegram`);
+        }
+
+        // Одноразовое использование
+        db.run(`DELETE FROM tg_pkce WHERE state = ?`, [state]);
 
         const clientId = process.env.TG_CLIENT_ID;
         const clientSecret = process.env.TG_CLIENT_SECRET;
         if (!clientId || !clientSecret) return res.status(500).send('Telegram OIDC not configured');
 
-        const origin = 'https://' + req.get('host');
+        const origin = serverOrigin(req);
         const redirectUri = `${origin}/auth/telegram/callback`;
 
-        // Обмен code -> id_token
         const body = new URLSearchParams({
             grant_type: 'authorization_code',
             code,
@@ -689,7 +759,6 @@ app.get('/auth/telegram/callback', async (req, res) => {
         const { id_token } = tokenRes.data;
         if (!id_token) return res.status(500).send('No id_token from Telegram');
 
-        // Проверка JWT через JWKS Telegram
         const { payload } = await jwtVerify(id_token, TG_JWKS, {
             issuer: TG_ISSUER,
             audience: clientId
@@ -714,9 +783,10 @@ app.get('/auth/telegram/callback', async (req, res) => {
                         `INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
                         [token, user.id, Date.now(), expires],
                         () => {
-                            const r = stored.redirect || '/';
-                            const sep = r.includes('?') ? '&' : '?';
-                            res.redirect(`${r}${sep}token=${token}&provider=telegram`);
+                            const target = stored.return_url || SITE_URL || '/';
+                            const sep = target.includes('?') ? '&' : '?';
+                            console.log('🔹 TG finish →', target);
+                            res.redirect(`${target}${sep}token=${token}&provider=telegram`);
                         }
                     );
                 };
@@ -753,11 +823,11 @@ app.get('/auth/google/start', (req, res) => {
     const clientId = process.env.GOOGLE_CLIENT_ID;
     if (!clientId) return res.status(500).send('GOOGLE_CLIENT_ID not set');
 
-    const redirect = req.query.redirect || '/';
-    const origin = 'https://' + req.get('host');
+    const returnUrl = normalizeReturnUrl(req.query.redirect);
+    const origin = serverOrigin(req);
     const redirectUri = `${origin}/auth/google/callback`;
 
-    const state = crypto.randomBytes(16).toString('hex') + '|' + encodeURIComponent(redirect);
+    const state = crypto.randomBytes(16).toString('hex') + '|' + encodeURIComponent(returnUrl);
 
     const params = querystring.stringify({
         client_id: clientId,
@@ -768,6 +838,7 @@ app.get('/auth/google/start', (req, res) => {
         state,
         prompt: 'select_account'
     });
+    console.log('🔹 GOOGLE start:', { redirectUri, returnUrl });
     res.redirect('https://accounts.google.com/o/oauth2/v2/auth?' + params);
 });
 
@@ -824,11 +895,11 @@ app.post('/auth/google/exchange', async (req, res) => {
         }
         if (!info || !info.sub) return res.status(401).json({ message: 'Google userinfo пуст' });
 
-        let redirect = '/';
+        let returnUrl = SITE_URL || '/';
         if (state) {
             const parts = String(state).split('|');
             if (parts[1]) {
-                try { redirect = decodeURIComponent(parts[1]); } catch(e){}
+                try { returnUrl = normalizeReturnUrl(decodeURIComponent(parts[1])); } catch(e){}
             }
         }
 
@@ -846,8 +917,9 @@ app.post('/auth/google/exchange', async (req, res) => {
                         `INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
                         [token, user.id, Date.now(), expires],
                         () => {
-                            const sep = redirect.includes('?') ? '&' : '?';
-                            res.json({ redirect: `${redirect}${sep}token=${token}&provider=google` });
+                            const sep = returnUrl.includes('?') ? '&' : '?';
+                            console.log('🔹 GOOGLE finish →', returnUrl);
+                            res.json({ redirect: `${returnUrl}${sep}token=${token}&provider=google` });
                         }
                     );
                 };
@@ -907,6 +979,8 @@ app.get('/', (req, res) => res.send('ProxyGem API работает ✅'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Сервер запущен на порту ${PORT}`);
+    console.log(`   PUBLIC_URL = ${PUBLIC_URL || '(не задан, вычисляется из Host)'}`);
+    console.log(`   SITE_URL   = ${SITE_URL || '(не задан)'}`);
 });
 
 process.on('SIGTERM', () => {
