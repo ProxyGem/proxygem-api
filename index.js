@@ -118,7 +118,8 @@ db.serialize(() => {
     db.run(`CREATE INDEX IF NOT EXISTS idx_activations_device ON activations(device_id)`);
 
     db.run(`CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, login TEXT UNIQUE NOT NULL,
+        id INTEGER PRIMARY KEY,
+        login TEXT UNIQUE NOT NULL,
         password_hash TEXT, nick TEXT, avatar TEXT, banner TEXT,
         created_at INTEGER NOT NULL, last_login INTEGER)`);
     db.run(`CREATE TABLE IF NOT EXISTS sessions (
@@ -132,7 +133,6 @@ db.serialize(() => {
         state TEXT PRIMARY KEY, verifier TEXT, return_url TEXT NOT NULL,
         provider TEXT NOT NULL, expires_at INTEGER NOT NULL)`);
 
-    // Друзья
     db.run(`CREATE TABLE IF NOT EXISTS friendships (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
@@ -143,7 +143,6 @@ db.serialize(() => {
     db.run(`CREATE INDEX IF NOT EXISTS idx_friendships_user ON friendships(user_id)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_friendships_friend ON friendships(friend_id)`);
 
-    // Сообщения
     db.run(`CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         sender_id INTEGER NOT NULL,
@@ -160,7 +159,7 @@ db.serialize(() => {
             ON messages(receiver_id, read_at)`);
 });
 
-// Миграция: user_id в activations
+// user_id в activations
 db.all(`PRAGMA table_info(activations)`, (err, cols) => {
     if (err || !cols) return;
     const hasUserId = cols.some(c => c.name === 'user_id');
@@ -198,6 +197,23 @@ db.all(`SELECT key_id, COUNT(*) as cnt FROM activations GROUP BY key_id`, (err, 
 // 3. УТИЛИТЫ
 // ==========================================
 function genToken() { return crypto.randomBytes(32).toString('hex'); }
+
+function genUserId() {
+    return Math.floor(1000000 + Math.random() * 9000000); // 1_000_000..9_999_999
+}
+function genUniqueUserId(cb) {
+    const tryOnce = (attempt) => {
+        if (attempt > 10) return cb(null);
+        const id = genUserId();
+        db.get(`SELECT id FROM users WHERE id = ?`, [id], (err, row) => {
+            if (err) return cb(null);
+            if (row) return tryOnce(attempt + 1);
+            cb(id);
+        });
+    };
+    tryOnce(0);
+}
+
 function authUser(req) {
     const h = req.headers.authorization || '';
     const token = h.startsWith('Bearer ') ? h.slice(7) : null;
@@ -395,20 +411,23 @@ app.post('/auth/register', async (req, res) => {
             if (row) return res.status(409).json({ message: 'Логин занят' });
             const hash = await bcrypt.hash(pass, 10);
             const now = Date.now();
-            db.run(`INSERT INTO users (login, password_hash, nick, created_at, last_login) VALUES (?, ?, ?, ?, ?)`,
-                [cleanLogin, hash, cleanLogin, now, now], function (err2) {
-                    if (err2) {
-                        if (String(err2.message).includes('UNIQUE')) return res.status(409).json({ message: 'Логин занят' });
-                        return res.status(500).json({ message: 'db_error' });
-                    }
-                    const userId = this.lastID;
-                    createSession(userId).then(token => {
-                        if (!token) return res.status(500).json({ message: 'session_error' });
-                        db.get(`SELECT * FROM users WHERE id = ?`, [userId], (e, u) => {
-                            res.json({ token, user: publicUser(u) });
+            genUniqueUserId((newId) => {
+                if (!newId) return res.status(500).json({ message: 'id_gen_error' });
+                db.run(`INSERT INTO users (id, login, password_hash, nick, created_at, last_login) VALUES (?, ?, ?, ?, ?, ?)`,
+                    [newId, cleanLogin, hash, cleanLogin, now, now], function (err2) {
+                        if (err2) {
+                            if (String(err2.message).includes('UNIQUE')) return res.status(409).json({ message: 'Логин занят' });
+                            return res.status(500).json({ message: 'db_error' });
+                        }
+                        const userId = this.lastID;
+                        createSession(userId).then(token => {
+                            if (!token) return res.status(500).json({ message: 'session_error' });
+                            db.get(`SELECT * FROM users WHERE id = ?`, [userId], (e, u) => {
+                                res.json({ token, user: publicUser(u) });
+                            });
                         });
                     });
-                });
+            });
         });
     } catch (e) { res.status(500).json({ message: 'server_error' }); }
 });
@@ -525,10 +544,24 @@ app.get('/friends', requireAuth, (req, res) => {
         });
 });
 
+// Поиск: число → id; строка → login/nick
 app.get('/friends/search', requireAuth, (req, res) => {
     const q = String(req.query.q || '').trim();
     if (!q) return res.json({ users: [] });
     const uid = req.user.id;
+
+    if (/^\d+$/.test(q)) {
+        const idNum = parseInt(q, 10);
+        db.all(`SELECT id, login, nick, avatar FROM users
+                WHERE id != ? AND id = ?
+                LIMIT 20`,
+            [uid, idNum], (err, rows) => {
+                if (err) return res.status(500).json({ message: 'db_error' });
+                res.json({ users: rows.map(publicFriend) });
+            });
+        return;
+    }
+
     db.all(`SELECT id, login, nick, avatar FROM users
             WHERE id != ? AND (login LIKE ? OR nick LIKE ?)
             LIMIT 20`,
@@ -753,21 +786,25 @@ app.get('/auth/telegram/callback', async (req, res) => {
             }
             const now = Date.now();
             const tryInsert = (attempt) => {
+                if (attempt > 5) return redirectToSiteError(res, site, 'id_gen_error');
                 const tryLogin = attempt === 0 ? login : (login.slice(0, 20) + '_' + Math.random().toString(36).slice(2, 6));
-                db.run(`INSERT INTO users (login, nick, avatar, created_at, last_login) VALUES (?, ?, ?, ?, ?)`,
-                    [tryLogin, displayNick, avatar, now, now], function (e2) {
-                        if (e2) {
-                            if (String(e2.message).includes('UNIQUE') && attempt < 3) return tryInsert(attempt + 1);
-                            return redirectToSiteError(res, site, 'db_error');
-                        }
-                        const userId = this.lastID;
-                        db.run(`INSERT OR IGNORE INTO user_providers (user_id, provider, provider_id) VALUES (?, 'telegram', ?)`,
-                            [userId, providerId], async () => {
-                                const token = await createSession(userId);
-                                if (!token) return redirectToSiteError(res, site, 'session_error');
-                                redirectToSite(res, normalizeReturnUrl(stored.return_url), token, 'telegram');
-                            });
-                    });
+                genUniqueUserId((newId) => {
+                    if (!newId) return tryInsert(attempt + 1);
+                    db.run(`INSERT INTO users (id, login, nick, avatar, created_at, last_login) VALUES (?, ?, ?, ?, ?, ?)`,
+                        [newId, tryLogin, displayNick, avatar, now, now], function (e2) {
+                            if (e2) {
+                                if (String(e2.message).includes('UNIQUE')) return tryInsert(attempt + 1);
+                                return redirectToSiteError(res, site, 'db_error');
+                            }
+                            const userId = this.lastID;
+                            db.run(`INSERT OR IGNORE INTO user_providers (user_id, provider, provider_id) VALUES (?, 'telegram', ?)`,
+                                [userId, providerId], async () => {
+                                    const token = await createSession(userId);
+                                    if (!token) return redirectToSiteError(res, site, 'session_error');
+                                    redirectToSite(res, normalizeReturnUrl(stored.return_url), token, 'telegram');
+                                });
+                        });
+                });
             };
             tryInsert(0);
         });
@@ -883,22 +920,26 @@ app.post('/auth/google/exchange', async (req, res) => {
                 .replace(/[^A-Za-z0-9_.\-]/g, '_').slice(0, 24) || ('g_' + providerId);
             const now = Date.now();
             const tryInsert = (attempt) => {
+                if (attempt > 5) return res.status(500).json({ message: 'id_gen_error' });
                 const login = attempt === 0 ? loginBase : (loginBase.slice(0, 20) + '_' + Math.random().toString(36).slice(2, 6));
-                db.run(`INSERT INTO users (login, nick, avatar, created_at, last_login) VALUES (?, ?, ?, ?, ?)`,
-                    [login, displayNick, avatar, now, now], function (e2) {
-                        if (e2) {
-                            if (String(e2.message).includes('UNIQUE') && attempt < 3) return tryInsert(attempt + 1);
-                            return res.status(500).json({ message: 'db_error' });
-                        }
-                        const userId = this.lastID;
-                        db.run(`INSERT OR IGNORE INTO user_providers (user_id, provider, provider_id) VALUES (?, 'google', ?)`,
-                            [userId, providerId], async () => {
-                                const token = await createSession(userId);
-                                if (!token) return res.status(500).json({ message: 'session_error' });
-                                const sep = returnUrl.includes('?') ? '&' : '?';
-                                res.json({ redirect: `${returnUrl}${sep}token=${token}&provider=google` });
-                            });
-                    });
+                genUniqueUserId((newId) => {
+                    if (!newId) return tryInsert(attempt + 1);
+                    db.run(`INSERT INTO users (id, login, nick, avatar, created_at, last_login) VALUES (?, ?, ?, ?, ?, ?)`,
+                        [newId, login, displayNick, avatar, now, now], function (e2) {
+                            if (e2) {
+                                if (String(e2.message).includes('UNIQUE')) return tryInsert(attempt + 1);
+                                return res.status(500).json({ message: 'db_error' });
+                            }
+                            const userId = this.lastID;
+                            db.run(`INSERT OR IGNORE INTO user_providers (user_id, provider, provider_id) VALUES (?, 'google', ?)`,
+                                [userId, providerId], async () => {
+                                    const token = await createSession(userId);
+                                    if (!token) return res.status(500).json({ message: 'session_error' });
+                                    const sep = returnUrl.includes('?') ? '&' : '?';
+                                    res.json({ redirect: `${returnUrl}${sep}token=${token}&provider=google` });
+                                });
+                        });
+                });
             };
             tryInsert(0);
         });
