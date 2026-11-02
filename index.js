@@ -605,13 +605,19 @@ app.post('/profile/upload', requireAuth, upload.single('file'), (req, res) => {
 // TELEGRAM (без изменений)
 // ==========================================
 app.get('/auth/telegram/start', (req, res) => {
-    const bot = process.env.TG_BOT_NAME;
-    if (!bot) return res.status(500).send('TG_BOT_NAME not set');
+    const botToken = process.env.TG_BOT_TOKEN;
+    if (!botToken) return res.status(500).send('TG_BOT_TOKEN not set');
+
+    // bot_id — это часть токена до двоеточия
+    const botId = botToken.split(':')[0];
+    if (!botId) return res.status(500).send('Invalid TG_BOT_TOKEN');
+
     const redirect = req.query.redirect || '/';
     const origin = req.protocol + '://' + req.get('host');
     const returnTo = `${origin}/auth/telegram/callback?redirect=${encodeURIComponent(redirect)}`;
+
     res.redirect(
-        `https://oauth.telegram.org/auth?bot_id=${encodeURIComponent(bot)}&origin=${encodeURIComponent(origin)}&return_to=${encodeURIComponent(returnTo)}&request_access=write`
+        `https://oauth.telegram.org/auth?bot_id=${encodeURIComponent(botId)}&origin=${encodeURIComponent(origin)}&return_to=${encodeURIComponent(returnTo)}&request_access=write`
     );
 });
 
