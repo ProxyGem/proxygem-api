@@ -3,6 +3,11 @@ const cors = require('cors');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
+const multer = require('multer');
+const axios = require('axios');
+const querystring = require('querystring');
 
 const app = express();
 
@@ -11,7 +16,7 @@ const app = express();
 // ==========================================
 app.use(cors({
     origin: '*',
-    methods: ['GET', 'POST', 'OPTIONS'],
+    methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
 app.use(express.json({ limit: '2mb' }));
@@ -358,6 +363,437 @@ app.get('/api/status', (req, res) => {
             return res.json({ active: false });
         }
     );
+});
+
+// ==========================================
+// 6. АУТЕНТИФИКАЦИЯ И ПРОФИЛЬ
+// ==========================================
+// Таблицы
+db.serialize(() => {
+    db.run(`CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        login TEXT UNIQUE NOT NULL,
+        password_hash TEXT,
+        nick TEXT,
+        avatar TEXT,
+        banner TEXT,
+        created_at INTEGER NOT NULL,
+        last_login INTEGER
+    )`);
+    db.run(`CREATE TABLE IF NOT EXISTS sessions (
+        token TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+    )`);
+    db.run(`CREATE TABLE IF NOT EXISTS user_providers (
+        user_id INTEGER NOT NULL,
+        provider TEXT NOT NULL,
+        provider_id TEXT,
+        UNIQUE(user_id, provider)
+    )`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)`);
+});
+
+// Утилиты
+function genToken() {
+    return crypto.randomBytes(32).toString('hex');
+}
+function authUser(req) {
+    const h = req.headers.authorization || '';
+    const token = h.startsWith('Bearer ') ? h.slice(7) : null;
+    if (!token) return Promise.resolve(null);
+    return new Promise((resolve) => {
+        db.get(
+            `SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
+             WHERE s.token = ? AND s.expires_at > ?`,
+            [token, Date.now()],
+            (err, row) => resolve(err ? null : row)
+        );
+    });
+}
+async function requireAuth(req, res, next) {
+    const u = await authUser(req);
+    if (!u) return res.status(401).json({ message: 'Не авторизован' });
+    req.user = u;
+    next();
+}
+function publicUser(u, extra = {}) {
+    return {
+        id: u.id,
+        login: u.login,
+        nick: u.nick || u.login,
+        avatar: u.avatar || null,
+        banner: u.banner || null,
+        regDate: new Date(u.created_at).toISOString(),
+        lastLogin: u.last_login ? new Date(u.last_login).toISOString() : null,
+        telegram: false,
+        google: false,
+        ...extra
+    };
+}
+function getUserProviders(userId) {
+    return new Promise((resolve) => {
+        db.all(`SELECT provider FROM user_providers WHERE user_id = ?`, [userId], (err, rows) => {
+            if (err || !rows) return resolve([]);
+            resolve(rows.map(r => r.provider));
+        });
+    });
+}
+
+// Регистрация
+app.post('/auth/register', async (req, res) => {
+    try {
+        const { login, password } = req.body || {};
+        const cleanLogin = String(login || '').trim();
+        const pass = String(password || '');
+
+        if (!/^[A-Za-z0-9_.\-]{3,24}$/.test(cleanLogin)) {
+            return res.status(400).json({ message: 'Логин: 3–24 символа (латиница, цифры, . _ -)' });
+        }
+        if (pass.length < 8 || pass.length > 72) {
+            return res.status(400).json({ message: 'Пароль: от 8 до 72 символов' });
+        }
+
+        db.get(`SELECT id FROM users WHERE login = ? COLLATE NOCASE`, [cleanLogin], async (err, row) => {
+            if (err) return res.status(500).json({ message: 'db_error' });
+            if (row) return res.status(409).json({ message: 'Логин занят' });
+
+            const hash = await bcrypt.hash(pass, 10);
+            const now = Date.now();
+            db.run(
+                `INSERT INTO users (login, password_hash, nick, created_at, last_login)
+                 VALUES (?, ?, ?, ?, ?)`,
+                [cleanLogin, hash, cleanLogin, now, now],
+                function (err2) {
+                    if (err2) {
+                        if (String(err2.message).includes('UNIQUE')) {
+                            return res.status(409).json({ message: 'Логин занят' });
+                        }
+                        return res.status(500).json({ message: 'db_error' });
+                    }
+                    const userId = this.lastID;
+                    const token = genToken();
+                    const expires = Date.now() + 30 * 24 * 60 * 60 * 1000;
+                    db.run(
+                        `INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
+                        [token, userId, Date.now(), expires],
+                        (err3) => {
+                            if (err3) return res.status(500).json({ message: 'session_error' });
+                            db.get(`SELECT * FROM users WHERE id = ?`, [userId], (e, u) => {
+                                res.json({ token, user: publicUser(u) });
+                            });
+                        }
+                    );
+                }
+            );
+        });
+    } catch (e) {
+        console.error('register:', e);
+        res.status(500).json({ message: 'server_error' });
+    }
+});
+
+// Вход
+app.post('/auth/login', (req, res) => {
+    const { login, password } = req.body || {};
+    const cleanLogin = String(login || '').trim();
+    const pass = String(password || '');
+    if (!cleanLogin || !pass) return res.status(400).json({ message: 'Заполните поля' });
+
+    db.get(`SELECT * FROM users WHERE login = ? COLLATE NOCASE`, [cleanLogin], async (err, u) => {
+        if (err) return res.status(500).json({ message: 'db_error' });
+        if (!u || !u.password_hash) return res.status(401).json({ message: 'Неверный логин или пароль' });
+
+        const ok = await bcrypt.compare(pass, u.password_hash);
+        if (!ok) return res.status(401).json({ message: 'Неверный логин или пароль' });
+
+        const token = genToken();
+        const expires = Date.now() + 30 * 24 * 60 * 60 * 1000;
+        db.run(
+            `INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
+            [token, u.id, Date.now(), expires],
+            (e2) => {
+                if (e2) return res.status(500).json({ message: 'session_error' });
+                db.run(`UPDATE users SET last_login = ? WHERE id = ?`, [Date.now(), u.id]);
+                res.json({ token, user: publicUser(u) });
+            }
+        );
+    });
+});
+
+// ME
+app.get('/auth/me', async (req, res) => {
+    const u = await authUser(req);
+    if (!u) return res.status(401).json({ message: 'Не авторизован' });
+    const providers = await getUserProviders(u.id);
+    res.json({
+        user: publicUser(u, {
+            telegram: providers.includes('telegram'),
+            google: providers.includes('google')
+        })
+    });
+});
+
+// Logout
+app.post('/auth/logout', (req, res) => {
+    const h = req.headers.authorization || '';
+    const token = h.startsWith('Bearer ') ? h.slice(7) : null;
+    if (!token) return res.json({ ok: true });
+    db.run(`DELETE FROM sessions WHERE token = ?`, [token], () => res.json({ ok: true }));
+});
+
+// PATCH /profile
+app.patch('/profile', requireAuth, (req, res) => {
+    const allowed = ['nick', 'avatar', 'banner'];
+    const updates = [];
+    const values = [];
+    for (const k of allowed) {
+        if (k in (req.body || {})) {
+            updates.push(`${k} = ?`);
+            values.push(req.body[k]);
+        }
+    }
+    if (!updates.length) return res.json({ user: publicUser(req.user) });
+    values.push(req.user.id);
+    db.run(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`, values, (err) => {
+        if (err) return res.status(500).json({ message: 'db_error' });
+        db.get(`SELECT * FROM users WHERE id = ?`, [req.user.id], async (e, u) => {
+            const providers = await getUserProviders(u.id);
+            res.json({ user: publicUser(u, {
+                telegram: providers.includes('telegram'),
+                google: providers.includes('google')
+            }) });
+        });
+    });
+});
+
+// Отвязка провайдера
+app.post('/profile/unlink', requireAuth, (req, res) => {
+    const provider = (req.body || {}).provider;
+    if (!['telegram', 'google'].includes(provider)) {
+        return res.status(400).json({ message: 'Неверный провайдер' });
+    }
+    // Проверяем, что у пользователя есть другой способ входа
+    getUserProviders(req.user.id).then(providers => {
+        const others = providers.filter(p => p !== provider);
+        const hasPassword = !!req.user.password_hash;
+        if (others.length === 0 && !hasPassword) {
+            return res.status(400).json({ message: 'Нельзя отвязать единственный способ входа' });
+        }
+        db.run(
+            `DELETE FROM user_providers WHERE user_id = ? AND provider = ?`,
+            [req.user.id, provider],
+            (err) => {
+                if (err) return res.status(500).json({ message: 'db_error' });
+                res.json({ ok: true });
+            }
+        );
+    });
+});
+
+// Загрузка картинок
+const uploadDir = path.join(__dirname, 'uploads');
+try { if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true }); } catch (e) {}
+app.use('/uploads', express.static(uploadDir));
+
+const upload = multer({
+    storage: multer.diskStorage({
+        destination: (req, file, cb) => cb(null, uploadDir),
+        filename: (req, file, cb) => {
+            const ext = (file.originalname.split('.').pop() || 'png').toLowerCase();
+            cb(null, Date.now() + '_' + crypto.randomBytes(6).toString('hex') + '.' + ext);
+        }
+    }),
+    limits: { fileSize: 8 * 1024 * 1024 },
+    fileFilter: (req, file, cb) => {
+        const ok = ['image/png', 'image/jpeg', 'image/webp'];
+        if (!ok.includes(file.mimetype)) return cb(new Error('bad_type'));
+        cb(null, true);
+    }
+});
+
+app.post('/profile/upload', requireAuth, upload.single('file'), (req, res) => {
+    if (!req.file) return res.status(400).json({ message: 'Файл не принят' });
+    const kind = req.body.kind === 'avatar' ? 'avatar' : 'banner';
+    const url = '/uploads/' + req.file.filename;
+    db.run(`UPDATE users SET ${kind} = ? WHERE id = ?`, [url, req.user.id], (err) => {
+        if (err) return res.status(500).json({ message: 'db_error' });
+        res.json({ url, kind });
+    });
+});
+
+// Telegram
+app.get('/auth/telegram/start', (req, res) => {
+    const bot = process.env.TG_BOT_NAME;
+    if (!bot) return res.status(500).send('TG_BOT_NAME not set');
+    const redirect = req.query.redirect || '/';
+    const origin = req.protocol + '://' + req.get('host');
+    const returnTo = `${origin}/auth/telegram/callback?redirect=${encodeURIComponent(redirect)}`;
+    res.redirect(
+        `https://oauth.telegram.org/auth?bot_id=${encodeURIComponent(bot)}&origin=${encodeURIComponent(origin)}&return_to=${encodeURIComponent(returnTo)}&request_access=write`
+    );
+});
+
+app.get('/auth/telegram/callback', (req, res) => {
+    const { id, first_name, last_name, username, photo_url, hash, redirect } = req.query;
+    const botToken = process.env.TG_BOT_TOKEN;
+    if (!botToken) return res.status(500).send('TG_BOT_TOKEN not set');
+
+    // Проверка подписи Telegram
+    const checkString = Object.keys(req.query)
+        .filter(k => k !== 'hash' && k !== 'redirect')
+        .sort()
+        .map(k => `${k}=${req.query[k]}`)
+        .join('\n');
+    const secret = crypto.createHash('sha256').update(botToken).digest();
+    const hmac = crypto.createHmac('sha256', secret).update(checkString).digest('hex');
+    if (hmac !== hash) return res.status(400).send('Invalid Telegram hash');
+
+    const providerId = String(id);
+    db.get(
+        `SELECT u.* FROM user_providers p JOIN users u ON u.id = p.user_id
+         WHERE p.provider = 'telegram' AND p.provider_id = ?`,
+        [providerId],
+        (err, u) => {
+            if (err) return res.status(500).send('db_error');
+            const finish = (user) => {
+                const token = genToken();
+                const expires = Date.now() + 30 * 24 * 60 * 60 * 1000;
+                db.run(
+                    `INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
+                    [token, user.id, Date.now(), expires],
+                    () => {
+                        const r = redirect || '/';
+                        const sep = r.includes('?') ? '&' : '?';
+                        res.redirect(`${r}${sep}token=${token}&provider=telegram`);
+                    }
+                );
+            };
+            if (u) return finish(u);
+
+            const login = (username || 'tg_' + providerId).replace(/[^A-Za-z0-9_.\-]/g, '_').slice(0, 24);
+            const nick = [first_name, last_name].filter(Boolean).join(' ') || login;
+            const now = Date.now();
+            db.run(
+                `INSERT INTO users (login, nick, avatar, created_at, last_login) VALUES (?, ?, ?, ?, ?)`,
+                [login, nick, photo_url || null, now, now],
+                function (e2) {
+                    if (e2) return res.status(500).send('db_error');
+                    const userId = this.lastID;
+                    db.run(
+                        `INSERT OR IGNORE INTO user_providers (user_id, provider, provider_id) VALUES (?, 'telegram', ?)`,
+                        [userId, providerId]
+                    );
+                    db.get(`SELECT * FROM users WHERE id = ?`, [userId], (e3, nu) => finish(nu));
+                }
+            );
+        }
+    );
+});
+
+// Google
+app.get('/auth/google/start', (req, res) => {
+    const clientId = process.env.GOOGLE_CLIENT_ID;
+    if (!clientId) return res.status(500).send('GOOGLE_CLIENT_ID not set');
+    const redirect = req.query.redirect || '/';
+    const origin = req.protocol + '://' + req.get('host');
+    const redirectUri = `${origin}/auth/google/callback`;
+    const state = crypto.randomBytes(16).toString('hex') + '|' + encodeURIComponent(redirect);
+    const params = querystring.stringify({
+        client_id: clientId,
+        redirect_uri: redirectUri,
+        response_type: 'code',
+        scope: 'openid email profile',
+        access_type: 'online',
+        prompt: 'select_account',
+        state
+    });
+    res.redirect('https://accounts.google.com/o/oauth2/v2/auth?' + params);
+});
+
+app.get('/auth/google/callback', async (req, res) => {
+    try {
+        const { code, state } = req.query;
+        const clientId = process.env.GOOGLE_CLIENT_ID;
+        const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+        if (!clientId || !clientSecret) return res.status(500).send('Google OAuth not configured');
+
+        const [, redirectEnc] = String(state || '').split('|');
+        const redirect = redirectEnc ? decodeURIComponent(redirectEnc) : '/';
+        const origin = req.protocol + '://' + req.get('host');
+        const redirectUri = `${origin}/auth/google/callback`;
+
+        const tokenRes = await axios.post('https://oauth2.googleapis.com/token', querystring.stringify({
+            code,
+            client_id: clientId,
+            client_secret: clientSecret,
+            redirect_uri: redirectUri,
+            grant_type: 'authorization_code'
+        }), { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+
+        const { access_token } = tokenRes.data;
+
+        const info = await axios.get('https://www.googleapis.com/oauth2/v2/userinfo', {
+            headers: { Authorization: 'Bearer ' + access_token }
+        });
+        const g = info.data; // { id, email, name, picture, ... }
+        const providerId = String(g.id);
+
+        db.get(
+            `SELECT u.* FROM user_providers p JOIN users u ON u.id = p.user_id
+             WHERE p.provider = 'google' AND p.provider_id = ?`,
+            [providerId],
+            (err, u) => {
+                if (err) return res.status(500).send('db_error');
+                const finish = (user) => {
+                    const token = genToken();
+                    const expires = Date.now() + 30 * 24 * 60 * 60 * 1000;
+                    db.run(
+                        `INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
+                        [token, user.id, Date.now(), expires],
+                        () => {
+                            const sep = redirect.includes('?') ? '&' : '?';
+                            res.redirect(`${redirect}${sep}token=${token}&provider=google`);
+                        }
+                    );
+                };
+                if (u) return finish(u);
+
+                const login = (g.email ? g.email.split('@')[0] : 'g_' + providerId)
+                    .replace(/[^A-Za-z0-9_.\-]/g, '_').slice(0, 24);
+                const nick = g.name || login;
+                const now = Date.now();
+                db.run(
+                    `INSERT INTO users (login, nick, avatar, created_at, last_login) VALUES (?, ?, ?, ?, ?)`,
+                    [login, nick, g.picture || null, now, now],
+                    function (e2) {
+                        if (e2) return res.status(500).send('db_error');
+                        const userId = this.lastID;
+                        db.run(
+                            `INSERT OR IGNORE INTO user_providers (user_id, provider, provider_id) VALUES (?, 'google', ?)`,
+                            [userId, providerId]
+                        );
+                        db.get(`SELECT * FROM users WHERE id = ?`, [userId], (e3, nu) => finish(nu));
+                    }
+                );
+            }
+        );
+    } catch (e) {
+        console.error('google callback:', e.response ? e.response.data : e.message);
+        res.status(500).send('google_error');
+    }
+});
+
+// DELETE account
+app.delete('/account', requireAuth, (req, res) => {
+    const id = req.user.id;
+    db.run(`DELETE FROM sessions WHERE user_id = ?`, [id]);
+    db.run(`DELETE FROM user_providers WHERE user_id = ?`, [id]);
+    db.run(`DELETE FROM users WHERE id = ?`, [id], (err) => {
+        if (err) return res.status(500).json({ message: 'db_error' });
+        res.json({ ok: true });
+    });
 });
 
 // ==========================================
