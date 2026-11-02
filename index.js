@@ -8,6 +8,7 @@ const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const axios = require('axios');
 const querystring = require('querystring');
+const { jwtVerify, createRemoteJWKSet } = require('jose');
 
 const app = express();
 
@@ -602,102 +603,166 @@ app.post('/profile/upload', requireAuth, upload.single('file'), (req, res) => {
 });
 
 // ==========================================
-// TELEGRAM (без изменений)
+// TELEGRAM — OIDC (Authorization Code + PKCE)
 // ==========================================
-app.get('/auth/telegram/start', (req, res) => {
-    const botToken = process.env.TG_BOT_TOKEN;
-    if (!botToken) return res.status(500).send('TG_BOT_TOKEN not set');
+const TG_ISSUER = 'https://oauth.telegram.org';
+const TG_JWKS = createRemoteJWKSet(new URL(TG_ISSUER + '/.well-known/jwks.json'));
 
-    // bot_id — это часть токена до двоеточия
-    const botId = botToken.split(':')[0];
-    if (!botId) return res.status(500).send('Invalid TG_BOT_TOKEN');
+// Временное хранилище PKCE (в памяти). Для продакшена лучше SQLite/Redis.
+const tgPkceStore = new Map(); // state -> { verifier, redirect, expires }
+
+function base64url(buf) {
+    return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+app.get('/auth/telegram/start', (req, res) => {
+    const clientId = process.env.TG_CLIENT_ID;
+    if (!clientId) return res.status(500).send('TG_CLIENT_ID not set');
 
     const redirect = req.query.redirect || '/';
-    const origin = req.protocol + '://' + req.get('host');
-    const returnTo = `${origin}/auth/telegram/callback?redirect=${encodeURIComponent(redirect)}`;
+    const origin = 'https://' + req.get('host');
+    const redirectUri = `${origin}/auth/telegram/callback`;
 
-    res.redirect(
-        `https://oauth.telegram.org/auth?bot_id=${encodeURIComponent(botId)}&origin=${encodeURIComponent(origin)}&return_to=${encodeURIComponent(returnTo)}&request_access=write`
-    );
+    // PKCE
+    const verifier = base64url(crypto.randomBytes(32));
+    const challenge = base64url(crypto.createHash('sha256').update(verifier).digest());
+    const state = crypto.randomBytes(16).toString('hex');
+
+    tgPkceStore.set(state, {
+        verifier,
+        redirect,
+        expires: Date.now() + 10 * 60 * 1000
+    });
+
+    // Чистим старые
+    for (const [k, v] of tgPkceStore) {
+        if (v.expires < Date.now()) tgPkceStore.delete(k);
+    }
+
+    const params = querystring.stringify({
+        client_id: clientId,
+        redirect_uri: redirectUri,
+        response_type: 'code',
+        scope: 'openid profile',
+        state,
+        code_challenge: challenge,
+        code_challenge_method: 'S256'
+    });
+
+    res.redirect(`${TG_ISSUER}/auth?${params}`);
 });
 
-app.get('/auth/telegram/callback', (req, res) => {
-    const { id, first_name, last_name, username, photo_url, hash, redirect } = req.query;
-    const botToken = process.env.TG_BOT_TOKEN;
-    if (!botToken) return res.status(500).send('TG_BOT_TOKEN not set');
+app.get('/auth/telegram/callback', async (req, res) => {
+    try {
+        const { code, state, error } = req.query;
 
-    const checkString = Object.keys(req.query)
-        .filter(k => k !== 'hash' && k !== 'redirect')
-        .sort()
-        .map(k => `${k}=${req.query[k]}`)
-        .join('\n');
-    const secret = crypto.createHash('sha256').update(botToken).digest();
-    const hmac = crypto.createHmac('sha256', secret).update(checkString).digest('hex');
-    if (hmac !== hash) return res.status(400).send('Invalid Telegram hash');
+        if (error) return res.status(400).send('Telegram error: ' + error);
+        if (!code || !state) return res.status(400).send('Missing code or state');
 
-    const providerId = String(id);
-    db.get(
-        `SELECT u.* FROM user_providers p JOIN users u ON u.id = p.user_id
-         WHERE p.provider = 'telegram' AND p.provider_id = ?`,
-        [providerId],
-        (err, u) => {
-            if (err) return res.status(500).send('db_error');
-            const finish = (user) => {
-                const token = genToken();
-                const expires = Date.now() + 30 * 24 * 60 * 60 * 1000;
+        const stored = tgPkceStore.get(state);
+        if (!stored) return res.status(400).send('Invalid state (expired or reused)');
+        tgPkceStore.delete(state);
+
+        const clientId = process.env.TG_CLIENT_ID;
+        const clientSecret = process.env.TG_CLIENT_SECRET;
+        if (!clientId || !clientSecret) return res.status(500).send('Telegram OIDC not configured');
+
+        const origin = 'https://' + req.get('host');
+        const redirectUri = `${origin}/auth/telegram/callback`;
+
+        // Обмен code -> id_token
+        const body = new URLSearchParams({
+            grant_type: 'authorization_code',
+            code,
+            redirect_uri: redirectUri,
+            client_id: clientId,
+            code_verifier: stored.verifier
+        });
+
+        const tokenRes = await axios.post(`${TG_ISSUER}/token`, body.toString(), {
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                Authorization: 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64')
+            }
+        });
+
+        const { id_token } = tokenRes.data;
+        if (!id_token) return res.status(500).send('No id_token from Telegram');
+
+        // Проверка JWT через JWKS Telegram
+        const { payload } = await jwtVerify(id_token, TG_JWKS, {
+            issuer: TG_ISSUER,
+            audience: clientId
+        });
+
+        const providerId = String(payload.id || payload.sub);
+        const username = payload.preferred_username || ('tg_' + providerId);
+        const nick = payload.name || username;
+        const avatar = payload.picture || null;
+
+        db.get(
+            `SELECT u.* FROM user_providers p JOIN users u ON u.id = p.user_id
+             WHERE p.provider = 'telegram' AND p.provider_id = ?`,
+            [providerId],
+            (err, existing) => {
+                if (err) return res.status(500).send('db_error');
+
+                const finish = (user) => {
+                    const token = genToken();
+                    const expires = Date.now() + 30 * 24 * 60 * 60 * 1000;
+                    db.run(
+                        `INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
+                        [token, user.id, Date.now(), expires],
+                        () => {
+                            const r = stored.redirect || '/';
+                            const sep = r.includes('?') ? '&' : '?';
+                            res.redirect(`${r}${sep}token=${token}&provider=telegram`);
+                        }
+                    );
+                };
+
+                if (existing) return finish(existing);
+
+                const login = username.replace(/[^A-Za-z0-9_.\-]/g, '_').slice(0, 24);
+                const now = Date.now();
                 db.run(
-                    `INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
-                    [token, user.id, Date.now(), expires],
-                    () => {
-                        const r = redirect || '/';
-                        const sep = r.includes('?') ? '&' : '?';
-                        res.redirect(`${r}${sep}token=${token}&provider=telegram`);
+                    `INSERT INTO users (login, nick, avatar, created_at, last_login) VALUES (?, ?, ?, ?, ?)`,
+                    [login, nick, avatar, now, now],
+                    function (e2) {
+                        if (e2) return res.status(500).send('db_error');
+                        const userId = this.lastID;
+                        db.run(
+                            `INSERT OR IGNORE INTO user_providers (user_id, provider, provider_id) VALUES (?, 'telegram', ?)`,
+                            [userId, providerId]
+                        );
+                        db.get(`SELECT * FROM users WHERE id = ?`, [userId], (e3, nu) => finish(nu));
                     }
                 );
-            };
-            if (u) return finish(u);
-
-            const login = (username || 'tg_' + providerId).replace(/[^A-Za-z0-9_.\-]/g, '_').slice(0, 24);
-            const nick = [first_name, last_name].filter(Boolean).join(' ') || login;
-            const now = Date.now();
-            db.run(
-                `INSERT INTO users (login, nick, avatar, created_at, last_login) VALUES (?, ?, ?, ?, ?)`,
-                [login, nick, photo_url || null, now, now],
-                function (e2) {
-                    if (e2) return res.status(500).send('db_error');
-                    const userId = this.lastID;
-                    db.run(
-                        `INSERT OR IGNORE INTO user_providers (user_id, provider, provider_id) VALUES (?, 'telegram', ?)`,
-                        [userId, providerId]
-                    );
-                    db.get(`SELECT * FROM users WHERE id = ?`, [userId], (e3, nu) => finish(nu));
-                }
-            );
-        }
-    );
+            }
+        );
+    } catch (e) {
+        console.error('telegram callback:', e.response ? e.response.data : e.message);
+        res.status(500).send('telegram_error');
+    }
 });
 
 // ==========================================
-// GOOGLE — ТОЛЬКО CLIENT_ID (implicit flow)
-// CHANGED: убрали GOOGLE_CLIENT_SECRET.
-// Используем response_type=token + Google Identity "userinfo" через access_token.
-// Секретов на сервере нет. Ничего не храним — только проверяем access_token через Google API.
+// GOOGLE — только CLIENT_ID (implicit flow)
 // ==========================================
 app.get('/auth/google/start', (req, res) => {
     const clientId = process.env.GOOGLE_CLIENT_ID;
     if (!clientId) return res.status(500).send('GOOGLE_CLIENT_ID not set');
 
     const redirect = req.query.redirect || '/';
-    const origin = req.protocol + '://' + req.get('host');
+    const origin = 'https://' + req.get('host');
     const redirectUri = `${origin}/auth/google/callback`;
 
-    // state: случайный id | куда вернуть пользователя
     const state = crypto.randomBytes(16).toString('hex') + '|' + encodeURIComponent(redirect);
 
     const params = querystring.stringify({
         client_id: clientId,
         redirect_uri: redirectUri,
-        response_type: 'token',          // CHANGED: implicit flow, без client_secret
+        response_type: 'token',
         scope: 'openid email profile',
         include_granted_scopes: 'true',
         state,
@@ -706,9 +771,6 @@ app.get('/auth/google/start', (req, res) => {
     res.redirect('https://accounts.google.com/o/oauth2/v2/auth?' + params);
 });
 
-// CHANGED: Google при implicit flow возвращает токен во #fragment.
-// Браузер НЕ отправляет fragment на сервер, поэтому здесь отдаём страницу-редирект,
-// которая на клиенте читает access_token из location.hash и отправляет его на сервер.
 app.get('/auth/google/callback', (req, res) => {
     const { state, error } = req.query;
 
@@ -716,7 +778,6 @@ app.get('/auth/google/callback', (req, res) => {
         return res.status(400).send('google_error: ' + error);
     }
 
-    // Отдаём HTML, который разберёт hash и передаст access_token на сервер
     const safeState = JSON.stringify(String(state || ''));
     res.type('html').send(`<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Google…</title>
@@ -747,14 +808,11 @@ display:grid;place-items:center;height:100vh;margin:0}
 </script></body></html>`);
 });
 
-// CHANGED: сервер принимает access_token от Google, проверяет его через userinfo
-// и создаёт/находит пользователя. Client secret не нужен.
 app.post('/auth/google/exchange', async (req, res) => {
     try {
         const { access_token, state } = req.body || {};
         if (!access_token) return res.status(400).json({ message: 'access_token required' });
 
-        // Проверяем access_token у Google
         let info;
         try {
             const r = await axios.get('https://www.googleapis.com/oauth2/v3/userinfo', {
@@ -766,7 +824,6 @@ app.post('/auth/google/exchange', async (req, res) => {
         }
         if (!info || !info.sub) return res.status(401).json({ message: 'Google userinfo пуст' });
 
-        // state: "random|redirect"
         let redirect = '/';
         if (state) {
             const parts = String(state).split('|');
@@ -801,7 +858,6 @@ app.post('/auth/google/exchange', async (req, res) => {
                 const nick = info.name || info.email || loginBase;
                 const now = Date.now();
 
-                // на случай коллизии login
                 const tryInsert = (attempt) => {
                     const login = attempt === 0 ? loginBase : (loginBase.slice(0, 20) + '_' + Math.random().toString(36).slice(2, 6));
                     db.run(
