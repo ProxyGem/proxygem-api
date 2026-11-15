@@ -40,7 +40,6 @@ function serverOrigin(req) {
     if (PUBLIC_URL) return PUBLIC_URL;
     return 'https://' + req.get('host');
 }
-// FIX: декодирование имени файла из latin1 → utf8 (мультер так отдаёт)
 function fixName(name) {
     if (!name) return name;
     try { return Buffer.from(name, 'latin1').toString('utf8'); } catch (e) { return name; }
@@ -84,32 +83,73 @@ db.run('PRAGMA journal_mode = WAL;');
 db.run('PRAGMA busy_timeout = 5000;');
 
 db.serialize(() => {
-    db.run(`CREATE TABLE IF NOT EXISTS activations (id INTEGER PRIMARY KEY AUTOINCREMENT, key_id TEXT, device_id TEXT, expires INTEGER)`);
+    // Активации: ключ привязан к user_id (профилю), а не к device_id
+    db.run(`CREATE TABLE IF NOT EXISTS activations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        key_id TEXT,
+        user_id INTEGER,
+        expires INTEGER
+    )`);
     db.run(`CREATE TABLE IF NOT EXISTS key_status (key_id TEXT PRIMARY KEY, gived INTEGER DEFAULT 0)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_activations_key ON activations(key_id)`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_activations_device ON activations(device_id)`);
-    db.run(`CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, login TEXT UNIQUE NOT NULL, password_hash TEXT, nick TEXT, avatar TEXT, banner TEXT, created_at INTEGER NOT NULL, last_login INTEGER)`);
-    db.run(`CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)`);
-    db.run(`CREATE TABLE IF NOT EXISTS user_providers (user_id INTEGER NOT NULL, provider TEXT NOT NULL, provider_id TEXT, UNIQUE(user_id, provider))`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_activations_user ON activations(user_id)`);
+
+    db.run(`CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY,
+        login TEXT UNIQUE NOT NULL,
+        password_hash TEXT,
+        nick TEXT,
+        avatar TEXT,
+        banner TEXT,
+        created_at INTEGER NOT NULL,
+        last_login INTEGER
+    )`);
+    db.run(`CREATE TABLE IF NOT EXISTS sessions (
+        token TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+    )`);
+    db.run(`CREATE TABLE IF NOT EXISTS user_providers (
+        user_id INTEGER NOT NULL,
+        provider TEXT NOT NULL,
+        provider_id TEXT,
+        UNIQUE(user_id, provider)
+    )`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)`);
-    db.run(`CREATE TABLE IF NOT EXISTS oauth_state (state TEXT PRIMARY KEY, verifier TEXT, return_url TEXT NOT NULL, provider TEXT NOT NULL, expires_at INTEGER NOT NULL)`);
-    db.run(`CREATE TABLE IF NOT EXISTS friendships (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, friend_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, UNIQUE(user_id, friend_id))`);
+    db.run(`CREATE TABLE IF NOT EXISTS oauth_state (
+        state TEXT PRIMARY KEY,
+        verifier TEXT,
+        return_url TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        expires_at INTEGER NOT NULL
+    )`);
+    db.run(`CREATE TABLE IF NOT EXISTS friendships (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        friend_id INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at INTEGER NOT NULL,
+        UNIQUE(user_id, friend_id)
+    )`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_friendships_user ON friendships(user_id)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_friendships_friend ON friendships(friend_id)`);
-    db.run(`CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender_id INTEGER NOT NULL, receiver_id INTEGER NOT NULL, type TEXT NOT NULL DEFAULT 'text', content TEXT, url TEXT, filename TEXT, created_at INTEGER NOT NULL, read_at INTEGER)`);
+    db.run(`CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender_id INTEGER NOT NULL,
+        receiver_id INTEGER NOT NULL,
+        type TEXT NOT NULL DEFAULT 'text',
+        content TEXT,
+        url TEXT,
+        filename TEXT,
+        created_at INTEGER NOT NULL,
+        read_at INTEGER
+    )`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_messages_pair ON messages(sender_id, receiver_id, created_at)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_messages_receiver ON messages(receiver_id, read_at)`);
 });
 
-db.all(`PRAGMA table_info(activations)`, (err, cols) => {
-    if (err || !cols) return;
-    const hasUserId = cols.some(c => c.name === 'user_id');
-    if (!hasUserId) db.run(`ALTER TABLE activations ADD COLUMN user_id INTEGER`, (e) => {
-        if (!e) { console.log('✅ user_id добавлен'); db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_activations_user_key ON activations(key_id, user_id)`); }
-    });
-    else db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_activations_user_key ON activations(key_id, user_id)`);
-});
-
+// Восстанавливаем флаги gived / used из БД
 db.all(`SELECT key_id FROM key_status WHERE gived = 1`, (err, rows) => {
     if (err || !rows) return;
     let n = 0; rows.forEach(r => { if (secretKeys[r.key_id]) { secretKeys[r.key_id].gived = true; n++; } });
@@ -177,7 +217,7 @@ function redirectToSiteError(res, siteUrl, code) {
     console.log('🔹 REDIRECT ERROR →', url); res.redirect(url);
 }
 
-// ===== ЗАГРУЗКА =====
+// ===== ЗАГРУЗКА ФАЙЛОВ =====
 const uploadDir = path.join(__dirname, 'uploads');
 try { if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true }); } catch (e) {}
 app.use('/uploads', express.static(uploadDir));
@@ -198,27 +238,36 @@ const upload = multer({
     }
 });
 
-// ===== КЛЮЧИ API =====
+// ===== API: ВЫДАТЬ КЛЮЧ =====
 app.post('/api/get-key', requireAuth, (req, res) => {
     const { duration } = req.body || {};
-    if (!duration) return res.status(400).json({ success: false, message: 'Не указан duration' });
+    if (!duration) return res.status(400).json({ success: false, message: 'no_duration' });
     let foundKey = null;
-    for (const [key, data] of Object.entries(secretKeys)) { if (key === 'PROXYGEM') continue; if (data.duration === duration && !data.gived && !data.used) { foundKey = key; break; } }
-    if (!foundKey) return res.status(404).json({ success: false, message: 'Нет ключей' });
+    for (const [key, data] of Object.entries(secretKeys)) {
+        if (key === 'PROXYGEM') continue;
+        if (data.duration === duration && !data.gived && !data.used) { foundKey = key; break; }
+    }
+    if (!foundKey) return res.status(404).json({ success: false, message: 'no_keys' });
     db.run(`INSERT OR REPLACE INTO key_status (key_id, gived) VALUES (?, 1)`, [foundKey], (err) => {
         if (err) return res.status(500).json({ success: false, message: 'db_error' });
         secretKeys[foundKey].gived = true;
         return res.json({ success: true, key: foundKey });
     });
 });
+
+// ===== API: АКТИВАЦИЯ (ключ привязывается к ПРОФИЛЮ) =====
 app.post('/api/activate', async (req, res) => {
     const user = await authUser(req);
     if (!user) return res.status(401).json({ success: false, message: 'auth_required' });
+
     const { key } = req.body || {};
     if (!key) return res.status(400).json({ success: false, message: 'no_key' });
+
     const cleanKey = String(key).trim().toUpperCase();
     const keyConfig = secretKeys[cleanKey];
     if (!keyConfig) return res.status(404).json({ success: false, message: 'invalid_key' });
+
+    // Пробный PROXYGEM — 1 раз на профиль
     if (cleanKey === 'PROXYGEM') {
         db.get(`SELECT * FROM activations WHERE key_id = ? AND user_id = ?`, [cleanKey, user.id], (err, row) => {
             if (err) return res.status(500).json({ success: false, message: 'db_error' });
@@ -231,20 +280,26 @@ app.post('/api/activate', async (req, res) => {
         });
         return;
     }
-    if (keyConfig.used && keyConfig.max_activations === 1) return res.status(400).json({ success: false, message: 'exhausted' });
+
+    if (keyConfig.used && keyConfig.max_activations === 1)
+        return res.status(400).json({ success: false, message: 'exhausted' });
+
     db.get(`SELECT * FROM activations WHERE key_id = ? AND user_id = ?`, [cleanKey, user.id], (err, row) => {
         if (err) return res.status(500).json({ success: false, message: 'db_error' });
         if (row) return res.status(400).json({ success: false, message: 'already_activated_by_you' });
-        db.get(`SELECT COUNT(*) as count FROM activations WHERE key_id = ?`, [cleanKey], (err, result) => {
-            if (err) return res.status(500).json({ success: false, message: 'db_error' });
-            if (result.count >= keyConfig.max_activations) { secretKeys[cleanKey].used = true; return res.status(400).json({ success: false, message: 'exhausted' }); }
-            const now = Date.now();
+
+        db.get(`SELECT COUNT(*) as count FROM activations WHERE key_id = ?`, [cleanKey], (err2, result) => {
+            if (err2) return res.status(500).json({ success: false, message: 'db_error' });
+            if (result.count >= keyConfig.max_activations) {
+                secretKeys[cleanKey].used = true;
+                return res.status(400).json({ success: false, message: 'exhausted' });
+            }
             let ms = 30 * 24 * 60 * 60 * 1000;
-            if (keyConfig.duration === '7_days') ms = 7 * 24 * 60 * 60 * 1000;
-            if (keyConfig.duration === '3_months') ms = 90 * 24 * 60 * 60 * 1000;
-            if (keyConfig.duration === '6_months') ms = 180 * 24 * 60 * 60 * 1000;
-            if (keyConfig.duration === 'forever') ms = 3650 * 24 * 60 * 60 * 1000;
-            const expires = now + ms;
+            if (keyConfig.duration === '7_days')   ms = 7    * 24 * 60 * 60 * 1000;
+            if (keyConfig.duration === '3_months') ms = 90   * 24 * 60 * 60 * 1000;
+            if (keyConfig.duration === '6_months') ms = 180  * 24 * 60 * 60 * 1000;
+            if (keyConfig.duration === 'forever')  ms = 3650 * 24 * 60 * 60 * 1000;
+            const expires = Date.now() + ms;
             db.run(`INSERT INTO activations (key_id, user_id, expires) VALUES (?, ?, ?)`, [cleanKey, user.id, expires], (e) => {
                 if (e) return res.status(500).json({ success: false, message: 'db_error' });
                 if (result.count + 1 >= keyConfig.max_activations) secretKeys[cleanKey].used = true;
@@ -253,6 +308,8 @@ app.post('/api/activate', async (req, res) => {
         });
     });
 });
+
+// ===== API: СТАТУС ПОДПИСКИ (по профилю) =====
 app.get('/api/status', async (req, res) => {
     const user = await authUser(req);
     if (!user) return res.status(401).json({ active: false, message: 'auth_required' });
@@ -322,6 +379,8 @@ app.post('/auth/logout', (req, res) => {
     if (!token) return res.json({ ok: true });
     db.run(`DELETE FROM sessions WHERE token = ?`, [token], () => res.json({ ok: true }));
 });
+
+// ===== ПРОФИЛЬ =====
 app.patch('/profile', requireAuth, (req, res) => {
     const allowed = ['nick','avatar','banner']; const updates = [], values = [];
     for (const k of allowed) if (k in (req.body || {})) { updates.push(`${k} = ?`); values.push(req.body[k]); }
@@ -450,7 +509,7 @@ app.post('/friends/remove', requireAuth, (req, res) => {
     });
 });
 
-// FIX: чужой профиль — доступен только друзьям
+// Чужой профиль — доступен только друзьям
 app.get('/users/:id', requireAuth, async (req, res) => {
     const uid = req.user.id;
     const targetId = parseInt(req.params.id, 10);
@@ -464,7 +523,7 @@ app.get('/users/:id', requireAuth, async (req, res) => {
     });
 });
 
-// FIX: очистка чата
+// ===== СООБЩЕНИЯ =====
 app.delete('/messages/:id', requireAuth, async (req, res) => {
     const uid = req.user.id;
     const otherId = parseInt(req.params.id, 10);
@@ -476,8 +535,6 @@ app.delete('/messages/:id', requireAuth, async (req, res) => {
             res.json({ ok: true, deleted: this.changes });
         });
 });
-
-// ===== СООБЩЕНИЯ =====
 app.get('/messages/:id', requireAuth, async (req, res) => {
     const uid = req.user.id;
     const otherId = parseInt(req.params.id, 10);
@@ -514,7 +571,7 @@ app.post('/messages/:id/upload', requireAuth, upload.single('file'), async (req,
     const isAudio = req.file.mimetype.startsWith('audio/');
     const type = isAudio ? 'audio' : 'image';
     const url = '/uploads/' + req.file.filename;
-    const filename = fixName(req.file.originalname); // FIX: utf8 имя
+    const filename = fixName(req.file.originalname);
     db.run(`INSERT INTO messages (sender_id, receiver_id, type, url, filename, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
         [uid, otherId, type, url, filename, Date.now()], function (err) {
             if (err) return res.status(500).json({ message: 'db_error' });
@@ -522,7 +579,7 @@ app.post('/messages/:id/upload', requireAuth, upload.single('file'), async (req,
         });
 });
 
-// ===== TELEGRAM =====
+// ===== TELEGRAM OAUTH =====
 const TG_ISSUER = 'https://oauth.telegram.org';
 const TG_JWKS = createRemoteJWKSet(new URL(TG_ISSUER + '/.well-known/jwks.json'));
 function base64url(buf) { return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); }
@@ -601,7 +658,7 @@ app.get('/auth/telegram/callback', async (req, res) => {
     }
 });
 
-// ===== GOOGLE =====
+// ===== GOOGLE OAUTH =====
 app.get('/auth/google/start', (req, res) => {
     const clientId = process.env.GOOGLE_CLIENT_ID;
     if (!clientId) return res.status(500).send('GOOGLE_CLIENT_ID not set');
@@ -687,6 +744,7 @@ app.post('/auth/google/exchange', async (req, res) => {
     }
 });
 
+// ===== УДАЛЕНИЕ АККАУНТА =====
 app.delete('/account', requireAuth, (req, res) => {
     const id = req.user.id;
     db.run(`DELETE FROM sessions WHERE user_id = ?`, [id]);
